@@ -4,7 +4,7 @@
 #        ponytail setup             check dependencies and configuration
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.1.1"
 
 # ── colors (disabled when piped) ──────────────────────────────────────
 if [[ -t 1 ]]; then
@@ -105,14 +105,41 @@ section() {
   echo ""
 }
 
+# Parse "1050" or "https://github.com/OWNER/REPO/pull/1050" into PR + REPO.
+# Sets PR; sets REPO only when the URL includes owner/repo.
+parse_pr_ref() {
+  local ref="$1"
+  if [[ "$ref" =~ ^[0-9]+$ ]]; then
+    PR="$ref"
+    return
+  fi
+  # https://github.com/owner/repo/pull/123  (optional trailing slash / fragment)
+  if [[ "$ref" =~ ^https?://github\.com/([^/]+)/([^/]+)/pull/([0-9]+)(/.*)?$ ]]; then
+    local owner="${BASH_REMATCH[1]}"
+    local name="${BASH_REMATCH[2]}"
+    PR="${BASH_REMATCH[3]}"
+    [[ -z "$REPO" ]] && REPO="${owner}/${name}"
+    return
+  fi
+  # github.com/owner/repo/pull/123 (no scheme)
+  if [[ "$ref" =~ ^github\.com/([^/]+)/([^/]+)/pull/([0-9]+)(/.*)?$ ]]; then
+    local owner="${BASH_REMATCH[1]}"
+    local name="${BASH_REMATCH[2]}"
+    PR="${BASH_REMATCH[3]}"
+    [[ -z "$REPO" ]] && REPO="${owner}/${name}"
+    return
+  fi
+  die "expected a PR number or GitHub URL — e.g. ponytail 1050 or ponytail https://github.com/OWNER/REPO/pull/1050"
+}
+
 # ── home / usage ──────────────────────────────────────────────────────
 usage() {
   logo
   echo "  ${DIM}AI PR reviews — bugs · regression · over-engineering${RST}"
   echo ""
   section "Commands"
-  suggest "review a PR"              "ponytail <PR>"
-  suggest "review with options"      "ponytail review <PR> [flags]"
+  suggest "review a PR"              "ponytail <PR|URL>"
+  suggest "review with options"      "ponytail review <PR|URL> [flags]"
   suggest "check your environment"   "ponytail setup"
   suggest "show this help"           "ponytail --help"
   suggest "print version"            "ponytail --version"
@@ -124,8 +151,8 @@ usage() {
   echo ""
   section "Try next"
   suggest "first-time check"         "ponytail setup"
-  suggest "safe preview"             "ponytail 162 --dry-run"
-  suggest "bugs only, dry-run"       "ponytail 42 --pass bugs --dry-run"
+  suggest "preview by number"        "ponytail 162 --dry-run"
+  suggest "preview by URL"           "ponytail https://github.com/OWNER/REPO/pull/162 --dry-run"
   suggest "post review for real"     "ponytail 162 --repo OWNER/REPO"
   echo ""
   section "API keys (in ~/.zshrc)"
@@ -264,11 +291,13 @@ parse_review_args() {
       --dry-run) DRY_RUN=true; shift ;;
       -*)        die "unknown flag '$1' — try ponytail --help" ;;
       *)
-        [[ -z "$PR" ]] && { PR="$1"; shift; } || die "unexpected argument '$1'"
+        [[ -n "$PR" ]] && die "unexpected argument '$1'"
+        parse_pr_ref "$1"
+        shift
         ;;
     esac
   done
-  [[ -z "$PR" ]] && die "missing PR number — e.g. ponytail 162 --dry-run"
+  [[ -z "$PR" ]] && die "missing PR — e.g. ponytail 162 --dry-run"
   [[ ${#PASSES[@]} -eq 0 ]] && PASSES=(bugs regression ponytail)
   if [[ -z "$REPO" ]]; then
     REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) \
@@ -685,7 +714,7 @@ main() {
     -v|--version|version) echo "ponytail $VERSION" ;;
     "")           usage ;;
     *)
-      if [[ "$1" =~ ^[0-9]+$ ]]; then
+      if [[ "$1" =~ ^[0-9]+$ || "$1" =~ github\.com/.+/pull/[0-9]+ ]]; then
         cmd_review "$@"
       else
         die "unknown command '$1' — try ponytail --help"
