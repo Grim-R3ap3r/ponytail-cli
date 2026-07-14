@@ -8,11 +8,11 @@ VERSION="1.0.0"
 
 # ── colors (disabled when piped) ──────────────────────────────────────
 if [[ -t 1 ]]; then
-  RST='\033[0m'  B='\033[1m'  DIM='\033[2m'
-  RED='\033[31m'  GRN='\033[32m'  YLW='\033[33m'
-  BLU='\033[34m'  MAG='\033[35m'  CYN='\033[36m'
-  BRED='\033[1;31m'  BGRN='\033[1;32m'  BYLW='\033[1;33m'
-  BCYN='\033[1;36m'  BMAG='\033[1;35m'  BBLU='\033[1;34m'
+  RST=$'\033[0m'  B=$'\033[1m'  DIM=$'\033[2m'
+  RED=$'\033[31m'  GRN=$'\033[32m'  YLW=$'\033[33m'
+  BLU=$'\033[34m'  MAG=$'\033[35m'  CYN=$'\033[36m'
+  BRED=$'\033[1;31m'  BGRN=$'\033[1;32m'  BYLW=$'\033[1;33m'
+  BCYN=$'\033[1;36m'  BMAG=$'\033[1;35m'  BBLU=$'\033[1;34m'
 else
   RST='' B='' DIM='' RED='' GRN='' YLW=''
   BLU='' MAG='' CYN='' BRED='' BGRN='' BYLW=''
@@ -37,59 +37,57 @@ TMPDIR_PT=""
 AI_ENGINE=""
 
 # ── cleanup ───────────────────────────────────────────────────────────
-cleanup() { [[ -n "${TMPDIR_PT:-}" ]] && rm -rf "$TMPDIR_PT"; }
+cleanup() { [[ -n "${TMPDIR_PT:-}" ]] && rm -rf "$TMPDIR_PT" || :; }
 trap cleanup EXIT
 
 # ── pretty helpers ────────────────────────────────────────────────────
 banner() {
-  printf '\n'
-  printf "  ${DIM}╭───────────────────────────────────╮${RST}\n"
-  printf "  ${DIM}│${RST}  ${B}ponytail${RST}  ${DIM}·${RST}  %-19s  ${DIM}│${RST}\n" "$1"
-  printf "  ${DIM}╰───────────────────────────────────╯${RST}\n"
-  printf '\n'
+  echo ""
+  echo "  ${DIM}╭──────────────────────────────────╮${RST}"
+  printf "  ${DIM}│${RST}  ${B}ponytail${RST}  ${DIM}·${RST}  %-18s${DIM}│${RST}\n" "$1"
+  echo "  ${DIM}╰──────────────────────────────────╯${RST}"
+  echo ""
 }
 
-die()  { printf "  ${BRED}error:${RST} %s\n" "$*" >&2; exit 1; }
-info() { printf "  ${DIM}→${RST} %s\n" "$*"; }
+die()  { echo "  ${BRED}error:${RST} $*" >&2; exit 1; }
+info() { echo "  ${DIM}→${RST} $*"; }
 ok()   { printf "  ${BGRN}✓${RST}  %-12s %s\n" "$1" "$2"; }
 fail() { printf "  ${BRED}✗${RST}  %-12s %s\n" "$1" "$2"; }
 warn() { printf "  ${BYLW}!${RST}  %-12s %s\n" "$1" "$2"; }
 
 pass_color() {
   case "$1" in
-    bugs)       printf "${RED}" ;;
-    regression) printf "${YLW}" ;;
-    ponytail)   printf "${CYN}" ;;
-    *)          printf "${RST}" ;;
+    bugs)       echo -n "$RED" ;;
+    regression) echo -n "$YLW" ;;
+    ponytail)   echo -n "$CYN" ;;
+    *)          echo -n "$RST" ;;
   esac
 }
 
 # ── usage ─────────────────────────────────────────────────────────────
 usage() {
   banner "help"
-  cat <<EOF
-  ${B}USAGE${RST}
-    ponytail <PR>                     review a PR (all passes)
-    ponytail review <PR> [options]    review with options
-    ponytail setup                    check deps & config
-
-  ${B}OPTIONS${RST}
-    --repo OWNER/REPO    target repository (auto-detected if in a repo)
-    --pass TYPE          bugs | regression | ponytail | all (default: all)
-    --dry-run            print findings without posting to GitHub
-
-  ${B}ENVIRONMENT${RST}
-    CURSOR_API_KEY       preferred — uses Cursor SDK
-    ANTHROPIC_API_KEY    fallback — uses Anthropic API directly
-    CURSOR_MODEL         model for Cursor SDK (default: claude-sonnet-4)
-    ANTHROPIC_MODEL      model for Anthropic (default: claude-sonnet-4-20250514)
-
-  ${B}EXAMPLES${RST}
-    ponytail 162
-    ponytail 42 --repo Orange-Health/sorting-hat --pass bugs --dry-run
-    ponytail setup
-
-EOF
+  echo "  ${B}USAGE${RST}"
+  echo "    ponytail <PR>                     review a PR (all passes)"
+  echo "    ponytail review <PR> [options]    review with options"
+  echo "    ponytail setup                    check deps & config"
+  echo ""
+  echo "  ${B}OPTIONS${RST}"
+  echo "    --repo OWNER/REPO    target repository (auto-detected if in a repo)"
+  echo "    --pass TYPE          bugs | regression | ponytail | all (default: all)"
+  echo "    --dry-run            print findings without posting to GitHub"
+  echo ""
+  echo "  ${B}ENVIRONMENT${RST}"
+  echo "    CURSOR_API_KEY       preferred — uses Cursor SDK"
+  echo "    ANTHROPIC_API_KEY    fallback — uses Anthropic API directly"
+  echo "    CURSOR_MODEL         model for Cursor SDK (default: claude-sonnet-4)"
+  echo "    ANTHROPIC_MODEL      model for Anthropic (default: claude-sonnet-4-20250514)"
+  echo ""
+  echo "  ${B}EXAMPLES${RST}"
+  echo "    ponytail 162"
+  echo "    ponytail 42 --repo Orange-Health/sorting-hat --pass bugs --dry-run"
+  echo "    ponytail setup"
+  echo ""
 }
 
 # ── setup command ─────────────────────────────────────────────────────
@@ -157,12 +155,13 @@ cmd_setup() {
     fi
   fi
 
-  printf '\n'
+  echo ""
   if $all_ok; then
-    printf "  ${BGRN}All checks passed.${RST} Ready to review.\n\n"
+    echo "  ${BGRN}All checks passed.${RST} Ready to review."
   else
-    printf "  ${BRED}Some checks failed.${RST} Fix the issues above.\n\n"
+    echo "  ${BRED}Some checks failed.${RST} Fix the issues above."
   fi
+  echo ""
 }
 
 # ── arg parse ─────────────────────────────────────────────────────────
@@ -229,11 +228,10 @@ fetch_pr() {
     human_sz="${sz}B"
   fi
 
-  printf "  ${B}PR #%s${RST}  %s\n" "$PR" "$REPO"
-  printf "  ${CYN}%s${RST} ${DIM}→${RST} ${GRN}%s${RST}\n" "$HEAD_BRANCH" "$BASE_BRANCH"
-  printf "  ${DIM}commit${RST} %s  ${DIM}diff${RST} %s  ${DIM}engine${RST} %s\n" \
-    "${COMMIT:0:12}" "$human_sz" "$AI_ENGINE"
-  printf '\n'
+  echo "  ${B}PR #${PR}${RST}  ${REPO}"
+  echo "  ${CYN}${HEAD_BRANCH}${RST} ${DIM}→${RST} ${GRN}${BASE_BRANCH}${RST}"
+  echo "  ${DIM}commit${RST} ${COMMIT:0:12}  ${DIM}diff${RST} ${human_sz}  ${DIM}engine${RST} ${AI_ENGINE}"
+  echo ""
 }
 
 # ── prompts ───────────────────────────────────────────────────────────
@@ -350,11 +348,11 @@ run_ai_anthropic() {
     -H "anthropic-version: 2023-06-01" \
     -H "content-type: application/json" \
     -d @"$TMPDIR_PT/payload.json" \
-    https://api.anthropic.com/v1/messages) || { printf "  ${RED}curl failed ($pass_name)${RST}\n" >&2; echo "[]"; return; }
+    https://api.anthropic.com/v1/messages) || { echo "  ${RED}curl failed (${pass_name})${RST}" >&2; echo "[]"; return; }
 
   local err
   err=$(echo "$response" | jq -r '.error.message // empty' 2>/dev/null)
-  [[ -n "$err" ]] && { printf "  ${RED}AI error ($pass_name): $err${RST}\n" >&2; echo "[]"; return; }
+  [[ -n "$err" ]] && { echo "  ${RED}AI error (${pass_name}): ${err}${RST}" >&2; echo "[]"; return; }
 
   echo "$response" | jq -r '.content[0].text // "[]"'
 }
@@ -405,14 +403,14 @@ run_passes() {
   for pass in "${PASSES[@]}"; do
     local clr count prompt findings
     clr=$(pass_color "$pass")
-    printf "  ${clr}▸${RST} ${B}%-14s${RST}" "$pass"
+    printf "  %s▸%s %s%-14s%s" "$clr" "$RST" "$B" "$pass" "$RST"
     prompt=$("prompt_${pass}")
     findings=$(run_ai "$prompt" "$pass")
     count=$(echo "$findings" | jq 'length')
     if [[ "$count" -eq 0 ]]; then
-      printf "${BGRN}clean${RST}\n"
+      echo "${BGRN}clean${RST}"
     else
-      printf "${clr}%d finding(s)${RST}\n" "$count"
+      echo "${clr}${count} finding(s)${RST}"
     fi
     findings=$(echo "$findings" | jq --arg tag "$pass" '[.[] | . + {tag: $tag}]')
     all_findings=$(jq -s '.[0] + .[1]' <(echo "$all_findings") <(echo "$findings"))
@@ -441,9 +439,9 @@ post_findings() {
   [[ "$count" -eq 0 ]] && return
 
   if $DRY_RUN; then
-    printf "  ${DIM}─── findings (dry-run) ──────────────────────${RST}\n"
+    echo "  ${DIM}─── findings (dry-run) ──────────────────────${RST}"
   else
-    printf "  ${DIM}─── posting %d comment(s) ───────────────────${RST}\n" "$count"
+    echo "  ${DIM}─── posting ${count} comment(s) ───────────────────${RST}"
   fi
 
   local posted=0 failed=0
@@ -461,7 +459,7 @@ post_findings() {
     clr=$(pass_color "$first_tag")
 
     if $DRY_RUN; then
-      printf "  ${DIM}%s:%s${RST} ${clr}%s${RST}\n" "$path" "$line" "$full_body"
+      echo "  ${DIM}${path}:${line}${RST} ${clr}${full_body}${RST}"
     else
       if jq -n \
         --arg commit_id "$COMMIT" \
@@ -472,14 +470,14 @@ post_findings() {
         | gh api "repos/$REPO/pulls/$PR/comments" --method POST --input - >/dev/null 2>&1; then
         posted=$((posted + 1))
       else
-        printf "  ${RED}FAILED: %s:%s (line not in diff?)${RST}\n" "$path" "$line" >&2
+        echo "  ${RED}FAILED: ${path}:${line} (line not in diff?)${RST}" >&2
         failed=$((failed + 1))
       fi
       sleep "$POST_DELAY"
     fi
   done < <(jq -c '.[]' "$TMPDIR_PT/deduped.json")
 
-  $DRY_RUN || printf "  ${DIM}posted=%d  failed=%d${RST}\n" "$posted" "$failed"
+  $DRY_RUN || echo "  ${DIM}posted=${posted}  failed=${failed}${RST}"
   printf '\n'
 }
 
@@ -491,16 +489,16 @@ post_summary() {
   regression_n=$(jq '[.[] | select(.tag=="regression")] | length' "$TMPDIR_PT/findings.json")
   ponytail_n=$(jq   '[.[] | select(.tag=="ponytail")]   | length' "$TMPDIR_PT/findings.json")
 
-  printf "  ${DIM}┌────────────────────────────────────┐${RST}\n"
-  printf "  ${DIM}│${RST}  ${B}%-22s${RST} %8s  ${DIM}│${RST}\n" "Pass" "Findings"
-  printf "  ${DIM}├────────────────────────────────────┤${RST}\n"
-  printf "  ${DIM}│${RST}  ${RED}%-22s${RST} %8d  ${DIM}│${RST}\n" "Bugs / correctness" "$bugs_n"
-  printf "  ${DIM}│${RST}  ${YLW}%-22s${RST} %8d  ${DIM}│${RST}\n" "Regression risk" "$regression_n"
-  printf "  ${DIM}│${RST}  ${CYN}%-22s${RST} %8d  ${DIM}│${RST}\n" "Over-engineering" "$ponytail_n"
-  printf "  ${DIM}├────────────────────────────────────┤${RST}\n"
-  printf "  ${DIM}│${RST}  ${B}%-22s${RST} ${B}%8d${RST}  ${DIM}│${RST}\n" "Total" "$total"
-  printf "  ${DIM}└────────────────────────────────────┘${RST}\n"
-  printf '\n'
+  echo "  ${DIM}┌────────────────────────────────────┐${RST}"
+  printf "  ${DIM}│${RST}  ${B}%-22s%s %8s  ${DIM}│${RST}\n" "Pass" "$RST" "Findings"
+  echo "  ${DIM}├────────────────────────────────────┤${RST}"
+  printf "  ${DIM}│${RST}  ${RED}%-22s%s %8d  ${DIM}│${RST}\n" "Bugs / correctness" "$RST" "$bugs_n"
+  printf "  ${DIM}│${RST}  ${YLW}%-22s%s %8d  ${DIM}│${RST}\n" "Regression risk" "$RST" "$regression_n"
+  printf "  ${DIM}│${RST}  ${CYN}%-22s%s %8d  ${DIM}│${RST}\n" "Over-engineering" "$RST" "$ponytail_n"
+  echo "  ${DIM}├────────────────────────────────────┤${RST}"
+  printf "  ${DIM}│${RST}  ${B}%-22s%s ${B}%8d${RST}  ${DIM}│${RST}\n" "Total" "$RST" "$total"
+  echo "  ${DIM}└────────────────────────────────────┘${RST}"
+  echo ""
 
   local verdict="See inline comments for details."
   [[ "$total" -eq 0 ]] && verdict="Clean PR. Ship it."
@@ -534,7 +532,8 @@ cmd_review() {
   dedup_findings
   post_findings
   post_summary
-  printf "  ${BGRN}Done${RST} ${DIM}→${RST} https://github.com/%s/pull/%s\n\n" "$REPO" "$PR"
+  echo "  ${BGRN}Done${RST} ${DIM}→${RST} https://github.com/${REPO}/pull/${PR}"
+  echo ""
 }
 
 # ── main dispatch ─────────────────────────────────────────────────────
