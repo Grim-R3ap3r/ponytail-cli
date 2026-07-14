@@ -104,7 +104,7 @@ cmd_setup() {
     all_ok=false
   fi
 
-  if gh auth status &>/dev/null; then
+  if gh auth token &>/dev/null; then
     local gh_user
     gh_user=$(gh api user -q .login 2>/dev/null || echo "unknown")
     ok "gh auth" "authenticated as $gh_user"
