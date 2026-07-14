@@ -4,7 +4,7 @@
 #        ponytail setup             check dependencies and configuration
 set -euo pipefail
 
-VERSION="1.1.2"
+VERSION="1.1.3"
 
 # ── colors (disabled when piped) ──────────────────────────────────────
 # Soft 256-color accents when the terminal supports them; else basic ANSI.
@@ -321,6 +321,13 @@ cmd_setup() {
     fi
   fi
 
+  local skill_path
+  if skill_path=$(resolve_ponytail_skill); then
+    ok "ponytail-review" "$skill_path"
+  else
+    warn "ponytail-review" "skill missing — reinstall or set PONYTAIL_SKILL"
+  fi
+
   detected_repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null || true)
 
   echo ""
@@ -493,26 +500,64 @@ No issues → return [].  No markdown fences. No explanation. Just the JSON.
 PROMPT
 }
 
+# Resolve /ponytail-review skill (same content as Cursor's skill).
+# Prefer: env override → Cursor user skill → installed share → next to this script.
+resolve_ponytail_skill() {
+  local script_dir
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  local candidates=(
+    "${PONYTAIL_SKILL:-}"
+    "$HOME/.cursor/skills/ponytail-review/SKILL.md"
+    "$HOME/.local/share/ponytail/skills/ponytail-review/SKILL.md"
+    "$script_dir/skills/ponytail-review/SKILL.md"
+  )
+  local f
+  for f in "${candidates[@]}"; do
+    [[ -n "$f" && -f "$f" ]] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+
+# Strip YAML frontmatter from a SKILL.md
+skill_body() {
+  local file="$1"
+  awk '
+    BEGIN { fm=0; started=0 }
+    /^---[[:space:]]*$/ {
+      if (!started) { fm=1; started=1; next }
+      if (fm) { fm=0; next }
+    }
+    fm { next }
+    { print }
+  ' "$file"
+}
+
 prompt_ponytail() {
-cat <<'PROMPT'
-You hunt over-engineering in PR diffs. The diff's best outcome is getting shorter.
+  local skill_file skill
+  if ! skill_file=$(resolve_ponytail_skill); then
+    die "ponytail-review skill not found — reinstall or set PONYTAIL_SKILL=/path/to/SKILL.md"
+  fi
+  skill=$(skill_body "$skill_file")
 
-Tags (prefix body with the tag):
-- delete: dead code, unused flexibility, speculative feature. Replacement: nothing.
-- stdlib: hand-rolled thing the standard library ships. Name the function.
-- native: dependency or code doing what the platform already does. Name the feature.
-- yagni: abstraction with one implementation, config nobody sets, layer with one caller.
-- shrink: same logic, fewer lines. Show the shorter form inline.
+  # Skill is the source of truth (/ponytail-review). Adapter maps its
+  # one-line findings into the CLI's JSON comment schema.
+  cat <<PROMPT
+$skill
 
-Rules:
-- Only flag added code (+ lines).
-- A single smoke test or assert-based self-check is NOT bloat — never flag it.
-- "path" = file path from the diff header.
-- "line" = line number in the NEW version of the file.
-- "body" format: "<tag>: <what>. <replacement or nothing>. (-N lines)"
+## CLI output contract (required)
 
-Return ONLY a JSON array: [{"path":"...","line":N,"body":"..."}]
-Nothing to cut → return [].  No markdown fences. No explanation. Just the JSON.
+You are reviewing a GitHub PR diff (unified diff).
+Apply the ponytail-review rules above to ADDED lines only (+ lines).
+
+Emit findings as a JSON array for inline comments:
+[{"path":"...","line":N,"body":"<tag>: <what>. <replacement or nothing>. (-N lines)"}]
+
+- "path" = file path from the diff header (after b/).
+- "line" = line number in the NEW file (from the @@ hunk header).
+- "body" = one finding in the skill's tag style (delete/stdlib/native/yagni/shrink).
+- Do not include the trailing "net: -N" line in JSON; fold line savings into each body as (-N lines).
+- Nothing to cut → return [].
+- Return ONLY the JSON array. No markdown fences. No explanation.
 PROMPT
 }
 

@@ -68,7 +68,7 @@ ponytail setup                             # check dependencies & config
 |------|----------------|
 | **bugs** | Logic errors, nil dereferences, swallowed errors, type mismatches |
 | **regression** | Breaking API changes, removed fallbacks, changed error codes |
-| **ponytail** | Over-engineering, YAGNI violations, stdlib reimplementations |
+| **ponytail** | Over-engineering via the `/ponytail-review` skill (`skills/ponytail-review/SKILL.md`) |
 
 ### Options
 
