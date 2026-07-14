@@ -3,27 +3,17 @@
 AI-powered PR review CLI. Three review passes in one command — **bugs**, **regression risk**, and **over-engineering**.
 
 ```
-  ╭───────────────────────────────────╮
-  │  ponytail  ·  PR review CLI       │
-  ╰───────────────────────────────────╯
+   ╭─╮ ponytail  v1.1.0
+   ╰─╯ lazy senior reviews
 
-  PR #162  Orange-Health/sorting-hat
-  feat/email-propogate → main
-  commit a1b2c3d4e5f6  diff 4KB  engine cursor
+  Commands
+  review a PR                  ponytail <PR>
+  check your environment       ponytail setup
+  preview (no GitHub post)     --dry-run
 
-  ▸ bugs            2 finding(s)
-  ▸ regression      1 finding(s)
-  ▸ ponytail        clean
-
-  ┌────────────────────────────────────┐
-  │  Pass                    Findings  │
-  ├────────────────────────────────────┤
-  │  Bugs / correctness            2  │
-  │  Regression risk               1  │
-  │  Over-engineering              0  │
-  ├────────────────────────────────────┤
-  │  Total                         3  │
-  └────────────────────────────────────┘
+  Try next
+  first-time check             ponytail setup
+  safe preview                 ponytail 162 --dry-run
 ```
 
 ## Install
