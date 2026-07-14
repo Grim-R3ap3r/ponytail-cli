@@ -4,19 +4,33 @@
 #        ponytail setup             check dependencies and configuration
 set -euo pipefail
 
-VERSION="1.1.1"
+VERSION="1.1.2"
 
 # ── colors (disabled when piped) ──────────────────────────────────────
+# Soft 256-color accents when the terminal supports them; else basic ANSI.
 if [[ -t 1 ]]; then
   RST=$'\033[0m'  B=$'\033[1m'  DIM=$'\033[2m'  ITA=$'\033[3m'
   RED=$'\033[31m'  GRN=$'\033[32m'  YLW=$'\033[33m'
   BLU=$'\033[34m'  MAG=$'\033[35m'  CYN=$'\033[36m'
   BRED=$'\033[1;31m'  BGRN=$'\033[1;32m'  BYLW=$'\033[1;33m'
   BCYN=$'\033[1;36m'  BMAG=$'\033[1;35m'  BBLU=$'\033[1;34m'
+  if [[ "${COLORTERM:-}" == *truecolor* || "${TERM:-}" == *-256color* || "${TERM:-}" == xterm-kitty ]]; then
+    ACC=$'\033[38;5;216m'   # peach border
+    ACC2=$'\033[38;5;180m'  # warm label
+    MUTE=$'\033[38;5;245m'  # muted text
+    BUGC=$'\033[38;5;203m'
+    REGC=$'\033[38;5;221m'
+    PONC=$'\033[38;5;116m'
+    OKC=$'\033[38;5;114m'
+  else
+    ACC=$CYN  ACC2=$YLW  MUTE=$DIM
+    BUGC=$RED REGC=$YLW PONC=$CYN OKC=$GRN
+  fi
 else
   RST='' B='' DIM='' ITA='' RED='' GRN='' YLW=''
   BLU='' MAG='' CYN='' BRED='' BGRN='' BYLW=''
   BCYN='' BMAG='' BBLU=''
+  ACC='' ACC2='' MUTE='' BUGC='' REGC='' PONC='' OKC=''
 fi
 
 # ── config ────────────────────────────────────────────────────────────
@@ -24,6 +38,7 @@ CURSOR_MODEL="${CURSOR_MODEL:-claude-sonnet-4}"
 ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}"
 MAX_DIFF_BYTES=150000
 POST_DELAY=0.5
+BOX_W=58   # inner content width (between the side borders)
 
 # ── globals ───────────────────────────────────────────────────────────
 PR=""
@@ -41,52 +56,128 @@ cleanup() { [[ -n "${TMPDIR_PT:-}" ]] && rm -rf "$TMPDIR_PT" || :; }
 trap cleanup EXIT
 
 # ── pretty helpers ────────────────────────────────────────────────────
-hr() { echo "  ${DIM}────────────────────────────────────────────────${RST}"; }
+# Build a horizontal rule of N ─ characters (portable, no seq dependency).
+_rule() {
+  local n="$1" out="" i
+  for (( i=0; i<n; i++ )); do out+="─"; done
+  printf '%s' "$out"
+}
+
+# Outer rule width: content has one pad space on each side → BOX_W + 2
+_box_outer() { echo $(( BOX_W + 2 )); }
+
+box_top() {
+  local title="${1:-}" outer
+  outer=$(_box_outer)
+  if [[ -z "$title" ]]; then
+    echo "  ${ACC}╭$(_rule "$outer")╮${RST}"
+    return
+  fi
+  local tlen=${#title} left right inner
+  inner=$(( outer - tlen - 2 ))
+  (( inner < 2 )) && inner=2
+  left=$(( inner / 2 ))
+  right=$(( inner - left ))
+  printf "  ${ACC}╭%s ${ACC2}%s${ACC} %s╮${RST}\n" \
+    "$(_rule "$left")" "$title" "$(_rule "$right")"
+}
+
+box_bot() {
+  echo "  ${ACC}╰$(_rule "$(_box_outer)")╯${RST}"
+}
+
+box_sep() {
+  echo "  ${ACC}├$(_rule "$(_box_outer)")┤${RST}"
+}
+
+# Truncate a plain string to at most n characters (ellipsis if cut).
+_trunc() {
+  local s="$1" n="$2"
+  if (( ${#s} > n )); then
+    printf '%s' "${s:0:$((n-1))}…"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# Plain padded row (no ANSI in the padded string — keeps borders aligned).
+box_row() {
+  local text
+  text=$(_trunc "$1" "$BOX_W")
+  printf "  ${ACC}│${RST} %-${BOX_W}s ${ACC}│${RST}\n" "$text"
+}
+
+# Row with left label (plain) + right value (colored separately).
+# Usage: box_kv "Bugs / correctness" "1" "$BUGC"
+box_kv() {
+  local label="$1" value="$2" vcolor="${3:-$RST}"
+  local lpad vpad
+  value=$(_trunc "$value" 8)
+  vpad=${#value}
+  lpad=$(( BOX_W - vpad - 1 ))
+  (( lpad < 1 )) && lpad=1
+  label=$(_trunc "$label" "$lpad")
+  printf "  ${ACC}│${RST} %-${lpad}s ${vcolor}%s${RST} ${ACC}│${RST}\n" "$label" "$value"
+}
+
+# Label row + cyan command row (both clipped to BOX_W).
+box_cmd() {
+  local label="$1" cmd="$2"
+  box_row "• ${label}"
+  local shown
+  shown=$(_trunc "  ${cmd}" "$BOX_W")
+  # shown is plain length BOX_W; color the command text only
+  printf "  ${ACC}│${RST} ${BCYN}%-${BOX_W}s${RST} ${ACC}│${RST}\n" "$shown"
+}
+
+hr() { echo "  ${MUTE}$(_rule $((BOX_W + 2)))${RST}"; }
 
 logo() {
   echo ""
-  echo "  ${BCYN} ╭─╮ ${RST}${B}ponytail${RST}  ${DIM}v${VERSION}${RST}"
-  echo "  ${CYN} ╰─╯${RST} ${DIM}lazy senior reviews${RST}"
+  box_top "ponytail"
+  box_row "lazy senior reviews · v${VERSION}"
+  box_bot
   echo ""
 }
 
 banner() {
-  logo
-  echo "  ${DIM}·${RST} ${B}$1${RST}"
-  hr
+  echo ""
+  box_top "$1"
+  box_row "ponytail · v${VERSION}"
+  box_bot
   echo ""
 }
 
 die() {
   echo "" >&2
-  echo "  ${BRED}✗  error${RST}  $*" >&2
-  echo "" >&2
-  tip "try" "ponytail --help"
-  tip "check" "ponytail setup"
+  box_top "error" >&2
+  printf "  ${ACC}│${RST} ${BRED}%-${BOX_W}s${RST} ${ACC}│${RST}\n" "$*" >&2
+  box_sep >&2
+  printf "  ${ACC}│${RST} ${MUTE}%-${BOX_W}s${RST} ${ACC}│${RST}\n" "try   ponytail --help" >&2
+  printf "  ${ACC}│${RST} ${MUTE}%-${BOX_W}s${RST} ${ACC}│${RST}\n" "check ponytail setup" >&2
+  box_bot >&2
   echo "" >&2
   exit 1
 }
 
-info() { echo "  ${DIM}→${RST} $*"; }
-ok()   { printf "  ${BGRN}✓${RST}  %-14s %s\n" "$1" "$2"; }
-fail() { printf "  ${BRED}✗${RST}  %-14s %s\n" "$1" "$2"; }
-warn() { printf "  ${BYLW}!${RST}  %-14s %s\n" "$1" "$2"; }
+info() { echo "  ${MUTE}→${RST} $*"; }
+ok()   { printf "  ${OKC}✓${RST}  ${B}%-14s${RST} %s\n" "$1" "$2"; }
+fail() { printf "  ${BUGC}✗${RST}  ${B}%-14s${RST} %s\n" "$1" "$2"; }
+warn() { printf "  ${REGC}!${RST}  ${B}%-14s${RST} %s\n" "$1" "$2"; }
 
-# tip "label" "command"
 tip() {
-  printf "  ${DIM}%-8s${RST} ${BCYN}%s${RST}\n" "$1" "$2" >&2
+  printf "  ${MUTE}%-8s${RST} ${BCYN}%s${RST}\n" "$1" "$2" >&2
 }
 
-# suggest "description" "command"
 suggest() {
-  printf "  ${DIM}%-28s${RST} ${CYN}%s${RST}\n" "$1" "$2"
+  printf "  ${MUTE}%-28s${RST} ${BCYN}%s${RST}\n" "$1" "$2"
 }
 
 pass_color() {
   case "$1" in
-    bugs)       echo -n "$RED" ;;
-    regression) echo -n "$YLW" ;;
-    ponytail)   echo -n "$CYN" ;;
+    bugs)       echo -n "$BUGC" ;;
+    regression) echo -n "$REGC" ;;
+    ponytail)   echo -n "$PONC" ;;
     *)          echo -n "$RST" ;;
   esac
 }
@@ -101,7 +192,7 @@ pass_label() {
 }
 
 section() {
-  echo "  ${B}$1${RST}"
+  echo "  ${ACC2}${B}$1${RST}"
   echo ""
 }
 
@@ -135,32 +226,28 @@ parse_pr_ref() {
 # ── home / usage ──────────────────────────────────────────────────────
 usage() {
   logo
-  echo "  ${DIM}AI PR reviews — bugs · regression · over-engineering${RST}"
+  box_top "commands"
+  box_row "ponytail <PR|URL>              review a PR"
+  box_row "ponytail review <PR|URL> …     with flags"
+  box_row "ponytail setup                 check env"
+  box_row "ponytail --help / --version    meta"
+  box_sep
+  box_row "Flags"
+  box_row "  --repo OWNER/REPO"
+  box_row "  --pass bugs|regression|ponytail|all"
+  box_row "  --dry-run"
+  box_sep
+  box_row "Try next"
+  box_row "  ponytail setup"
+  box_row "  ponytail 162 --dry-run"
+  box_row "  ponytail <PR-URL> --dry-run"
+  box_sep
+  box_row "API keys → ~/.zshrc"
+  box_row "  export CURSOR_API_KEY=…"
+  box_row "  export ANTHROPIC_API_KEY=…"
+  box_bot
   echo ""
-  section "Commands"
-  suggest "review a PR"              "ponytail <PR|URL>"
-  suggest "review with options"      "ponytail review <PR|URL> [flags]"
-  suggest "check your environment"   "ponytail setup"
-  suggest "show this help"           "ponytail --help"
-  suggest "print version"            "ponytail --version"
-  echo ""
-  section "Flags"
-  suggest "target repo"              "--repo OWNER/REPO"
-  suggest "pass filter"              "--pass bugs|regression|ponytail|all"
-  suggest "preview (no GitHub post)" "--dry-run"
-  echo ""
-  section "Try next"
-  suggest "first-time check"         "ponytail setup"
-  suggest "preview by number"        "ponytail 162 --dry-run"
-  suggest "preview by URL"           "ponytail https://github.com/OWNER/REPO/pull/162 --dry-run"
-  suggest "post review for real"     "ponytail 162 --repo OWNER/REPO"
-  echo ""
-  section "API keys (in ~/.zshrc)"
-  echo "  ${DIM}export CURSOR_API_KEY=\"...\"${RST}     ${DIM}preferred${RST}"
-  echo "  ${DIM}export ANTHROPIC_API_KEY=\"...\"${RST}  ${DIM}fallback${RST}"
-  echo ""
-  hr
-  echo "  ${DIM}docs${RST}  https://github.com/Grim-R3ap3r/ponytail-cli"
+  echo "  ${MUTE}docs${RST}  ${ACC}https://github.com/Grim-R3ap3r/ponytail-cli${RST}"
   echo ""
 }
 
@@ -589,14 +676,16 @@ post_findings() {
     clr=$(pass_color "$first_tag")
 
     if $DRY_RUN; then
-      echo "  ${DIM}╭────────────────────────────────────────────╮${RST}"
-      printf "  ${DIM}│${RST} ${clr}%-10s${RST} ${DIM}%s:%s${RST}\n" "[$tags]" "$path" "$line"
-      echo "  ${DIM}│${RST}"
-      # wrap body across lines (simple)
-      echo "$body" | fold -s -w 42 | while IFS= read -r bline; do
-        printf "  ${DIM}│${RST} %-42s\n" "$bline"
+      local loc="${path}:${line}"
+      (( ${#loc} > BOX_W )) && loc="${loc:0:$((BOX_W-1))}…"
+      box_top "finding"
+      printf "  ${ACC}│${RST} ${clr}%-${BOX_W}s${RST} ${ACC}│${RST}\n" "[$tags]"
+      box_row "$loc"
+      box_sep
+      echo "$body" | fold -s -w "$BOX_W" | while IFS= read -r bline; do
+        box_row "$bline"
       done
-      echo "  ${DIM}╰────────────────────────────────────────────╯${RST}"
+      box_bot
       echo ""
     else
       if jq -n \
@@ -631,23 +720,26 @@ post_summary() {
   regression_n=$(jq '[.[] | select(.tag=="regression")] | length' "$TMPDIR_PT/findings.json")
   ponytail_n=$(jq   '[.[] | select(.tag=="ponytail")]   | length' "$TMPDIR_PT/findings.json")
 
-  section "Summary"
-  echo "  ${DIM}┌──────────────────────────────────────┐${RST}"
-  printf "  ${DIM}│${RST}  %-24s %8s  ${DIM}│${RST}\n" "Pass" "Count"
-  echo "  ${DIM}├──────────────────────────────────────┤${RST}"
-  printf "  ${DIM}│${RST}  ${RED}%-24s${RST} %8d  ${DIM}│${RST}\n" "Bugs / correctness" "$bugs_n"
-  printf "  ${DIM}│${RST}  ${YLW}%-24s${RST} %8d  ${DIM}│${RST}\n" "Regression risk" "$regression_n"
-  printf "  ${DIM}│${RST}  ${CYN}%-24s${RST} %8d  ${DIM}│${RST}\n" "Over-engineering" "$ponytail_n"
-  echo "  ${DIM}├──────────────────────────────────────┤${RST}"
-  printf "  ${DIM}│${RST}  ${B}%-24s %8d${RST}  ${DIM}│${RST}\n" "Total" "$total"
-  echo "  ${DIM}└──────────────────────────────────────┘${RST}"
-  echo ""
-
+  box_top "summary"
+  box_kv "Pass" "Count" "$MUTE"
+  box_sep
+  box_kv "Bugs / correctness" "$bugs_n" "$BUGC"
+  box_kv "Regression risk" "$regression_n" "$REGC"
+  box_kv "Over-engineering" "$ponytail_n" "$PONC"
+  box_sep
+  box_kv "Total" "$total" "$B"
   if [[ "$total" -eq 0 ]]; then
-    echo "  ${BGRN}Clean PR. Ship it.${RST}"
+    box_sep
+    box_row "✓  Clean PR. Ship it."
   else
-    echo "  ${BYLW}${total} finding(s)${RST} — review before merge."
+    box_sep
+    box_row "!  ${total} finding(s) — review before merge."
   fi
+  if ! $DRY_RUN; then
+    box_sep
+    box_row "→  Summary posted on the PR"
+  fi
+  box_bot
   echo ""
 
   local verdict="See inline comments for details."
@@ -668,28 +760,26 @@ $verdict
 EOF
 
   if ! $DRY_RUN; then
-    gh pr review "$PR" --repo "$REPO" --comment --body "$summary" >/dev/null 2>&1
-    info "Summary posted on the PR"
-    echo ""
+    gh pr review "$PR" --repo "$REPO" --comment --body "$summary" >/dev/null 2>&1 || true
   fi
 }
 
 # ── next-step hints after a review ────────────────────────────────────
 print_next_steps() {
   local pr_url="https://github.com/${REPO}/pull/${PR}"
-  hr
-  echo ""
-  section "Try next"
+  box_top "try next"
   if $DRY_RUN; then
-    suggest "post this review"     "ponytail ${PR} --repo ${REPO}"
-    suggest "re-run bugs only"     "ponytail ${PR} --repo ${REPO} --pass bugs --dry-run"
+    box_cmd "post this review"  "ponytail ${PR} --repo ${REPO}"
+    box_cmd "re-run bugs only"  "ponytail ${PR} --repo ${REPO} --pass bugs --dry-run"
   else
-    suggest "open the PR"          "gh pr view ${PR} --repo ${REPO} --web"
-    suggest "preview next time"    "ponytail ${PR} --repo ${REPO} --dry-run"
+    box_cmd "open the PR"       "gh pr view ${PR} --repo ${REPO} --web"
+    box_cmd "preview next time" "ponytail ${PR} --repo ${REPO} --dry-run"
   fi
-  suggest "open in browser"        "open ${pr_url}"
-  echo ""
-  echo "  ${BGRN}Done${RST}  ${DIM}${pr_url}${RST}"
+  box_cmd "open in browser" "open ${pr_url}"
+  box_sep
+  box_row "✓  Done — review complete"
+  box_row "${pr_url}"
+  box_bot
   echo ""
 }
 
