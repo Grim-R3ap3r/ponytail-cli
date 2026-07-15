@@ -4,7 +4,7 @@
 #        ponytail setup             check dependencies and configuration
 set -euo pipefail
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 
 # ── colors (disabled when piped) ──────────────────────────────────────
 # Soft 256-color accents when the terminal supports them; else basic ANSI.
@@ -524,6 +524,229 @@ fetch_file_context() {
   if (( fetched > 0 )); then
     info "fetched ${fetched} file(s) for context"
   fi
+
+  build_file_line_index
+  build_hunk_map
+}
+
+# Index fetched files: path → line count (for evidence existence checks).
+build_file_line_index() {
+  : > "$TMPDIR_PT/file_line_counts"
+  [[ ! -s "$TMPDIR_PT/file_context" ]] && return
+  local cur="" n=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^---\ FILE:\ (.+)\ ---$ ]]; then
+      if [[ -n "$cur" ]]; then
+        printf '%s\t%d\n' "$cur" "$n" >> "$TMPDIR_PT/file_line_counts"
+      fi
+      cur="${BASH_REMATCH[1]}"
+      n=0
+      continue
+    fi
+    [[ -n "$cur" ]] && n=$((n + 1))
+  done < "$TMPDIR_PT/file_context"
+  if [[ -n "$cur" ]]; then
+    printf '%s\t%d\n' "$cur" "$n" >> "$TMPDIR_PT/file_line_counts"
+  fi
+}
+
+# Map of valid RIGHT-side diff lines (added + context) for GitHub inline comments.
+# Writes: hunk_lines as "path:line" one per row; also paths list.
+build_hunk_map() {
+  : > "$TMPDIR_PT/hunk_lines"
+  : > "$TMPDIR_PT/diff_paths"
+  local path="" new_line=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ "$line" =~ ^diff\ --git\ a/.+\ b/(.+)$ ]]; then
+      path="${BASH_REMATCH[1]}"
+      echo "$path" >> "$TMPDIR_PT/diff_paths"
+      continue
+    fi
+    if [[ "$line" =~ ^@@\ -[0-9]+(,[0-9]+)?\ \+([0-9]+)(,[0-9]+)?\ @@ ]]; then
+      new_line="${BASH_REMATCH[2]}"
+      continue
+    fi
+    [[ -z "$path" ]] && continue
+    case "$line" in
+      ---*|+++*|index\ *|new\ file*|deleted\ file*|similarity\ *|rename\ *)
+        continue
+        ;;
+      +*)
+        # Added line on the RIGHT side — valid attach target.
+        printf '%s:%s\n' "$path" "$new_line" >> "$TMPDIR_PT/hunk_lines"
+        new_line=$((new_line + 1))
+        ;;
+      -*)
+        # Deleted from LEFT only — do not advance new_line.
+        ;;
+      \\*)
+        # "\ No newline at end of file"
+        ;;
+      *)
+        # Context line — also valid as RIGHT side attach in many GitHub cases;
+        # we record it but prefer snapping to nearest including added.
+        printf '%s:%s\n' "$path" "$new_line" >> "$TMPDIR_PT/hunk_lines"
+        new_line=$((new_line + 1))
+        ;;
+    esac
+  done < "$TMPDIR_PT/diff"
+  sort -u "$TMPDIR_PT/hunk_lines" -o "$TMPDIR_PT/hunk_lines"
+  sort -u "$TMPDIR_PT/diff_paths" -o "$TMPDIR_PT/diff_paths"
+}
+
+# Snap a proposed line to a valid RIGHT-side diff line for path.
+# Prints snapped line, or empty if none within window.
+snap_line_to_hunk() {
+  local path="$1" want="$2"
+  local window="${3:-25}"
+  [[ -z "$path" || -z "$want" ]] && return 1
+  if grep -qxF "${path}:${want}" "$TMPDIR_PT/hunk_lines" 2>/dev/null; then
+    echo "$want"
+    return 0
+  fi
+  local best="" bestdist=999999 line dist
+  while IFS= read -r entry; do
+    [[ "$entry" == "$path":* ]] || continue
+    line="${entry##*:}"
+    [[ "$line" =~ ^[0-9]+$ ]] || continue
+    dist=$(( line > want ? line - want : want - line ))
+    if (( dist <= window && dist < bestdist )); then
+      bestdist=$dist
+      best=$line
+    fi
+  done < "$TMPDIR_PT/hunk_lines"
+  if [[ -n "$best" ]]; then
+    echo "$best"
+    return 0
+  fi
+  return 1
+}
+
+# True if path exists in fetched files or in the diff.
+path_known() {
+  local path="$1"
+  grep -qxF "$path" "$TMPDIR_PT/file_list" 2>/dev/null && return 0
+  grep -qxF "$path" "$TMPDIR_PT/diff_paths" 2>/dev/null && return 0
+  return 1
+}
+
+# True if path:line is plausible given what we fetched.
+# Prefer exact fetched file line-count; else require the line appears in the hunk map.
+evidence_pinpoint_exists() {
+  local path="$1" line="$2"
+  path_known "$path" || return 1
+  [[ "$line" =~ ^[0-9]+$ ]] || return 1
+  (( line < 1 )) && return 1
+
+  local count=""
+  count=$(awk -F'\t' -v p="$path" '$1==p {print $2; exit}' "$TMPDIR_PT/file_line_counts" 2>/dev/null || true)
+  if [[ -n "$count" ]]; then
+    (( line <= count )) && return 0
+    return 1
+  fi
+  # File was in the diff but not fetched fully — only trust hunk map lines.
+  grep -qxF "${path}:${line}" "$TMPDIR_PT/hunk_lines" 2>/dev/null
+}
+
+# Parse "path:line — note" / "path:line - note" → path, line on stdout as: path<TAB>line
+parse_evidence_pinpoint() {
+  local raw="$1"
+  # Trim, then match path:digits at start.
+  if [[ "$raw" =~ ^([A-Za-z0-9_./\\-]+):([0-9]+)([[:space:]].*)?$ ]]; then
+    printf '%s\t%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+    return 0
+  fi
+  return 1
+}
+
+# Drop findings whose evidence pinpoints are hallucinated; also scrub bad evidence entries.
+verify_evidence_exists() {
+  local input_file="$1" output_file="$2"
+  local kept="[]"
+  local dropped=0
+  local total=0
+
+  while IFS= read -r row; do
+    total=$((total + 1))
+    local path evidence_json ok_evidence="[]"
+    path=$(echo "$row" | jq -r '.path')
+    evidence_json=$(echo "$row" | jq -c '.evidence // []')
+
+    while IFS= read -r ev; do
+      [[ -z "$ev" || "$ev" == "null" ]] && continue
+      local parsed ep el
+      parsed=$(parse_evidence_pinpoint "$ev") || continue
+      ep="${parsed%%$'\t'*}"
+      el="${parsed#*$'\t'}"
+      if evidence_pinpoint_exists "$ep" "$el"; then
+        ok_evidence=$(jq -c --arg e "$ev" '. + [$e]' <<<"$ok_evidence")
+      fi
+    done < <(echo "$evidence_json" | jq -r '.[]')
+
+    local ok_n
+    ok_n=$(echo "$ok_evidence" | jq 'length')
+    if (( ok_n == 0 )); then
+      dropped=$((dropped + 1))
+      continue
+    fi
+
+    # Regression still needs ≥1 consumer outside finding path among surviving evidence.
+    local body
+    body=$(echo "$row" | jq -r '.body // ""')
+    if [[ "$body" =~ [Rr]egression ]]; then
+      local has_consumer
+      has_consumer=$(echo "$ok_evidence" | jq --arg p "$path" \
+        '[.[] | select(startswith($p + ":") | not)] | length')
+      if (( has_consumer == 0 )); then
+        dropped=$((dropped + 1))
+        continue
+      fi
+    fi
+
+    local updated
+    updated=$(echo "$row" | jq -c --argjson ev "$ok_evidence" '.evidence = $ev')
+    kept=$(jq -s -c '.[0] + [.[1]]' <(echo "$kept") <(echo "$updated"))
+  done < <(jq -c '.[]' "$input_file")
+
+  echo "$kept" > "$output_file"
+  if (( dropped > 0 )); then
+    info "evidence check: dropped ${dropped}/${total} (hallucinated or unverifiable pinpoints)"
+  fi
+}
+
+# Snap each finding's line onto a valid diff hunk line; orphans → orphans.json.
+snap_findings_to_hunks() {
+  local input_file="$1"
+  local attached="[]"
+  local orphans="[]"
+  local snapped_n=0 orphan_n=0
+
+  while IFS= read -r row; do
+    local path line snapped
+    path=$(echo "$row" | jq -r '.path')
+    line=$(echo "$row" | jq -r '.line')
+    if snapped=$(snap_line_to_hunk "$path" "$line"); then
+      if [[ "$snapped" != "$line" ]]; then
+        snapped_n=$((snapped_n + 1))
+        row=$(echo "$row" | jq -c --argjson l "$snapped" --argjson orig "$line" \
+          '.line = $l | .snapped_from = $orig')
+      fi
+      attached=$(jq -s -c '.[0] + [.[1]]' <(echo "$attached") <(echo "$row"))
+    else
+      orphan_n=$((orphan_n + 1))
+      row=$(echo "$row" | jq -c '.orphan = true')
+      orphans=$(jq -s -c '.[0] + [.[1]]' <(echo "$orphans") <(echo "$row"))
+    fi
+  done < <(jq -c '.[]' "$input_file")
+
+  echo "$attached" > "$TMPDIR_PT/deduped.json"
+  echo "$orphans" > "$TMPDIR_PT/orphans.json"
+  if (( snapped_n > 0 )); then
+    info "snapped ${snapped_n} finding(s) onto nearest diff lines"
+  fi
+  if (( orphan_n > 0 )); then
+    info "${orphan_n} finding(s) not on a diff line — will go in summary only"
+  fi
 }
 
 # ── prompts ───────────────────────────────────────────────────────────
@@ -955,6 +1178,13 @@ run_passes() {
   pre_verify_count=$(echo "$all_findings" | jq 'length')
 
   if (( pre_verify_count > 0 )); then
+    echo "$all_findings" > "$TMPDIR_PT/pre_evidence.json"
+    verify_evidence_exists "$TMPDIR_PT/pre_evidence.json" "$TMPDIR_PT/post_evidence.json"
+    all_findings=$(cat "$TMPDIR_PT/post_evidence.json")
+    pre_verify_count=$(echo "$all_findings" | jq 'length')
+  fi
+
+  if (( pre_verify_count > 0 )); then
     echo ""
     printf "  ${DIM}verifying %d finding(s)…${RST}" "$pre_verify_count"
     local verified
@@ -1007,6 +1237,11 @@ dedup_findings() {
       "$TMPDIR_PT/deduped.json" > "$TMPDIR_PT/deduped.t"
     mv "$TMPDIR_PT/deduped.t" "$TMPDIR_PT/deduped.json"
   fi
+
+  # Drop hallucinated evidence, then snap lines onto real diff hunks.
+  verify_evidence_exists "$TMPDIR_PT/deduped.json" "$TMPDIR_PT/deduped.verified"
+  mv "$TMPDIR_PT/deduped.verified" "$TMPDIR_PT/deduped.json"
+  snap_findings_to_hunks "$TMPDIR_PT/deduped.json"
 }
 
 # Render a review comment that pinpoints evidence for the author.
@@ -1047,7 +1282,12 @@ format_comment_body() {
 post_findings() {
   local count
   count=$(jq 'length' "$TMPDIR_PT/deduped.json")
-  [[ "$count" -eq 0 ]] && return
+  [[ "$count" -eq 0 ]] && {
+    local ocount=0
+    [[ -f "$TMPDIR_PT/orphans.json" ]] && ocount=$(jq 'length' "$TMPDIR_PT/orphans.json")
+    (( ocount > 0 )) && info "${ocount} finding(s) deferred to summary (no attachable diff line)"
+    return
+  }
 
   if $DRY_RUN; then
     section "Findings ${DIM}(dry-run — not posted)${RST}"
@@ -1059,7 +1299,7 @@ post_findings() {
 
   while IFS= read -r row; do
     n=$((n + 1))
-    local path line body tags severity confidence impact evidence full_body first_tag clr
+    local path line body tags severity confidence impact evidence full_body first_tag clr snapped_from
     path=$(echo "$row" | jq -r '.path')
     line=$(echo "$row" | jq -r '.line')
     body=$(echo "$row" | jq -r '.body')
@@ -1068,7 +1308,12 @@ post_findings() {
     confidence=$(echo "$row" | jq -r '.confidence // 0')
     impact=$(echo "$row" | jq -r '.impact // ""')
     evidence=$(echo "$row" | jq -c '.evidence // []')
+    snapped_from=$(echo "$row" | jq -r '.snapped_from // empty')
     full_body=$(format_comment_body "$tags" "$severity" "$confidence" "$body" "$impact" "$evidence")
+    if [[ -n "$snapped_from" ]]; then
+      full_body+=$'\n\n'
+      full_body+="_Line attached at ${path}:${line} (model suggested :${snapped_from})._"
+    fi
 
     first_tag="${tags%%,*}"
     first_tag="${first_tag## }"
@@ -1080,6 +1325,9 @@ post_findings() {
       box_top "finding"
       printf "  ${ACC}│${RST} ${clr}%-${BOX_W}s${RST} ${ACC}│${RST}\n" "[$tags] $severity c${confidence}"
       box_row "$loc"
+      if [[ -n "$snapped_from" ]]; then
+        box_row "(snapped from :${snapped_from})"
+      fi
       box_sep
       echo "$full_body" | fold -s -w "$BOX_W" | while IFS= read -r bline; do
         box_row "$bline"
@@ -1097,7 +1345,13 @@ post_findings() {
         posted=$((posted + 1))
         printf "  ${BGRN}✓${RST}  %s:%s\n" "$path" "$line"
       else
-        echo "  ${RED}✗${RST}  ${path}:${line}  ${DIM}(line not in diff?)${RST}" >&2
+        # Last resort: treat as orphan so the author still sees it in the summary.
+        echo "  ${YLW}!${RST}  ${path}:${line}  ${DIM}→ summary (GitHub rejected line)${RST}" >&2
+        local orphans
+        orphans=$(jq -s -c '.[0] + [.[1]]' \
+          <(jq -c '.' "$TMPDIR_PT/orphans.json" 2>/dev/null || echo '[]') \
+          <(echo "$row" | jq -c '.orphan = true | .attach_failed = true'))
+        echo "$orphans" > "$TMPDIR_PT/orphans.json"
         failed=$((failed + 1))
       fi
       sleep "$POST_DELAY"
@@ -1106,7 +1360,7 @@ post_findings() {
 
   if ! $DRY_RUN; then
     echo ""
-    echo "  ${DIM}posted ${posted} · failed ${failed}${RST}"
+    echo "  ${DIM}posted ${posted} · deferred ${failed}${RST}"
     echo ""
   fi
 }
@@ -1119,6 +1373,11 @@ post_summary() {
   regression_n=$(jq '[.[] | select(.tag=="regression")] | length' "$TMPDIR_PT/findings.json")
   ponytail_n=$(jq   '[.[] | select(.tag=="ponytail")]   | length' "$TMPDIR_PT/findings.json")
 
+  local orphan_n=0
+  [[ -f "$TMPDIR_PT/orphans.json" ]] && orphan_n=$(jq 'length' "$TMPDIR_PT/orphans.json")
+  local inline_n
+  inline_n=$(jq 'length' "$TMPDIR_PT/deduped.json" 2>/dev/null || echo 0)
+
   box_top "summary"
   box_kv "Pass" "Count" "$MUTE"
   box_sep
@@ -1127,6 +1386,8 @@ post_summary() {
   box_kv "Over-engineering" "$ponytail_n" "$PONC"
   box_sep
   box_kv "Total" "$total" "$B"
+  box_kv "Inline" "$inline_n" "$MUTE"
+  box_kv "Summary-only" "$orphan_n" "$MUTE"
   if [[ "$total" -eq 0 ]]; then
     box_sep
     box_row "✓  Clean PR. Ship it."
@@ -1143,6 +1404,25 @@ post_summary() {
 
   local verdict="See inline comments for details."
   [[ "$total" -eq 0 ]] && verdict="Clean PR. Ship it."
+  [[ "$orphan_n" -gt 0 ]] && verdict="Some findings could not be attached inline — listed below with evidence."
+
+  local orphan_md=""
+  if (( orphan_n > 0 )); then
+    orphan_md=$'\n### Findings without an attachable diff line\n\n'
+    while IFS= read -r row; do
+      local op ol ob oe oi ot
+      op=$(echo "$row" | jq -r '.path')
+      ol=$(echo "$row" | jq -r '.line')
+      ob=$(echo "$row" | jq -r '.body')
+      ot=$(echo "$row" | jq -r '.tags // .tag // ""')
+      oi=$(echo "$row" | jq -r '.impact // ""')
+      oe=$(echo "$row" | jq -r '(.evidence // []) | map("- `" + . + "`") | join("\n")')
+      orphan_md+="#### \`${op}:${ol}\` [$ot]"$'\n\n'
+      orphan_md+="${ob}"$'\n\n'
+      [[ -n "$oi" ]] && orphan_md+="**Impact:** ${oi}"$'\n\n'
+      [[ -n "$oe" ]] && orphan_md+="**Evidence:**"$'\n'"${oe}"$'\n\n'
+    done < <(jq -c '.[]' "$TMPDIR_PT/orphans.json")
+  fi
 
   local summary
   read -r -d '' summary <<EOF || true
@@ -1154,12 +1434,18 @@ post_summary() {
 | Regression risk | $regression_n |
 | Over-engineering | $ponytail_n |
 | **Total** | **$total** |
+| Inline comments | $inline_n |
+| Summary-only | $orphan_n |
 
 $verdict
+$orphan_md
 EOF
 
   if ! $DRY_RUN; then
     gh pr review "$PR" --repo "$REPO" --comment --body "$summary" >/dev/null 2>&1 || true
+  elif (( orphan_n > 0 )); then
+    section "Summary-only findings ${DIM}(no attachable line)${RST}"
+    echo "$orphan_md"
   fi
 }
 

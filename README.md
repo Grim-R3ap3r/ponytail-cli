@@ -3,7 +3,7 @@
 AI-powered PR review CLI. Three review passes in one command — **bugs**, **regression risk**, and **over-engineering**.
 
 ```
-   ╭─╮ ponytail  v2.1.0
+   ╭─╮ ponytail  v2.2.0
    ╰─╯ lazy senior reviews
 
   Commands
@@ -93,6 +93,17 @@ ponytail setup                             # check dependencies & config
 | `MAX_CONTEXT_FILES` | Max changed files to fetch full contents for (default: `20`) |
 | `MAX_INLINE_COMMENTS` | Hard cap on posted inline comments (default: `8`) |
 
+## v2.2 — verified evidence + reliable line attach
+
+- **Evidence existence check:** every `path:line` in `evidence[]` must exist in fetched file contents (line ≤ file length) or on a real diff hunk line. Hallucinated pinpoints are dropped before posting.
+- **Hunk line snap:** builds a map of valid RIGHT-side diff lines from `@@` hunks. If the model's line is slightly off, snaps to the nearest attachable line (within 25). If none exists, the finding goes in the **summary review** (with full evidence) instead of silently failing.
+- GitHub attach failures also fall back to the summary — authors always see the pinpoint.
+
+## v2.1 — evidence-backed comments
+
+Targets [partner-api#1780](https://github.com/Orange-Health/partner-api/pull/1780)-style FUD (*"any code depending on X will break"* with zero call sites).
+
+Every finding requires `evidence[]`, `impact`, and `severity`. Hard filters drop speculative wording and regressions without a consumer outside the changed file.
 
 Posted comments render as:
 
@@ -107,11 +118,6 @@ Remove fallback default timeout.
 - `worker/job.go:22 - still sleeps with old 30s assumption`
 ```
 
-If the model cannot name a concrete broken consumer → the finding is not posted.
-
-Also fixed: Anthropic engine now receives the same PR description + full-file context as the Cursor engine (v2.0 only wired that for Cursor).
-
-
 ## Requirements
 
 - [gh](https://cli.github.com/) — authenticated (`gh auth login`)
@@ -122,14 +128,12 @@ Also fixed: Anthropic engine now receives the same PR description + full-file co
 
 ## How it works
 
-1. Fetches the PR diff via `gh pr diff` and PR metadata (title, body)
-2. Fetches full file contents for changed files via `gh api`
-3. Runs three AI review passes with full context (diff + files + PR description)
-4. Filters findings by confidence score
-5. Runs a verification pass to prune false positives
-6. Deduplicates findings across passes
-7. Posts inline review comments on the PR
-8. Posts a summary table as a PR review comment
+1. Fetches the PR diff + metadata, and full contents of changed files
+2. Builds a RIGHT-side hunk map for attachable lines
+3. Runs review passes with confidence + evidence filters
+4. Verifies evidence pinpoints exist in known files / hunks
+5. Snaps comment lines onto real diff lines (or defers to summary)
+6. Posts inline comments + a summary review
 
 ## License
 
