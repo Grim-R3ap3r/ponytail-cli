@@ -3,7 +3,7 @@
 AI-powered PR review CLI. Three review passes in one command — **bugs**, **regression risk**, and **over-engineering**.
 
 ```
-   ╭─╮ ponytail  v2.0.0
+   ╭─╮ ponytail  v2.1.0
    ╰─╯ lazy senior reviews
 
   Commands
@@ -90,20 +90,41 @@ ponytail setup                             # check dependencies & config
 | `ANTHROPIC_MODEL_REVIEW` | Model for bugs/regression passes via Anthropic (default: same as `ANTHROPIC_MODEL`) |
 | `CONFIDENCE_THRESHOLD` | Minimum confidence (1-10) to post a finding (default: `7`) |
 | `PONYTAIL_MIN_ADDED` | Skip the over-engineering pass when added lines are below this (default: `80`) |
+| `MAX_CONTEXT_FILES` | Max changed files to fetch full contents for (default: `20`) |
+| `MAX_INLINE_COMMENTS` | Hard cap on posted inline comments (default: `8`) |
 
-## v2.0 — what changed
+## v2.1 — evidence-backed comments
 
-v2.0 is a quality-focused rewrite. The v1 review of [PR #167](https://github.com/Orange-Health/sorting-hat/pull/167) posted 5 comments — all 5 were dismissed by the PR author as false positives. Root cause: the model was reviewing a naked diff with zero codebase context, making unverifiable claims.
+v2.1 targets the failure mode from [partner-api#1780](https://github.com/Orange-Health/partner-api/pull/1780): comments like *"any code depending on X will break"* with **zero call sites**.
 
-### Fixes
+Every finding now requires:
+- `evidence[]` pinpoints (`path:line — what proves the claim`)
+- `impact` (who breaks and how)
+- `severity` (`blocker` | `warning` | `nit`)
 
-1. **Full file context** — fetches complete file contents (up to 8 files, 50KB each) alongside the diff. The model can now verify "is this variable used once?" or "do callers use positional init?" instead of guessing.
-2. **Confidence scoring** — every finding includes a confidence score (1-10). Findings below the threshold (default 7) are silently dropped.
-3. **Verification pass** — after the review passes generate findings, a second AI call receives the findings + full file context and prunes false positives.
-4. **Anti-hallucination guardrails** — explicit prompt rules: "do not claim X unless you can verify it in the provided context", "returning [] for a clean PR is correct", etc.
-5. **PR description included** — the model sees the PR title and body, understanding author intent before flagging.
-6. **Per-pass model support** — use a stronger model (e.g. Opus) for bugs/regression while keeping a faster model for the ponytail pass.
-7. **Small-diff skip** — the over-engineering pass is skipped for PRs under 80 added lines, where it produces noise instead of signal.
+Hard filters drop findings that:
+- lack pinpoints
+- use speculative wording (`may` / `might` / `will break` / `any code depending on…`)
+- claim a **regression** without citing a **consumer** outside the changed file itself
+- omit confidence (fail-closed)
+
+Posted comments render as:
+
+```markdown
+**[regression]** · warning · confidence 8
+
+Remove fallback default timeout.
+
+**Impact:** worker jobs time out under load.
+
+**Evidence:**
+- `worker/job.go:22 - still sleeps with old 30s assumption`
+```
+
+If the model cannot name a concrete broken consumer → the finding is not posted.
+
+Also fixed: Anthropic engine now receives the same PR description + full-file context as the Cursor engine (v2.0 only wired that for Cursor).
+
 
 ## Requirements
 

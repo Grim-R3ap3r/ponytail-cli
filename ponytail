@@ -4,7 +4,7 @@
 #        ponytail setup             check dependencies and configuration
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # ── colors (disabled when piped) ──────────────────────────────────────
 # Soft 256-color accents when the terminal supports them; else basic ANSI.
@@ -42,9 +42,10 @@ ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}"
 ANTHROPIC_MODEL_REVIEW="${ANTHROPIC_MODEL_REVIEW:-${ANTHROPIC_MODEL}}"
 MAX_DIFF_BYTES=150000
 MAX_FILE_BYTES=50000         # per-file cap when fetching full context
-MAX_CONTEXT_FILES=8          # fetch at most this many changed files
+MAX_CONTEXT_FILES="${MAX_CONTEXT_FILES:-20}"       # fetch at most this many changed files
 CONFIDENCE_THRESHOLD="${CONFIDENCE_THRESHOLD:-7}"  # 1-10; drop findings below this
 PONYTAIL_MIN_ADDED="${PONYTAIL_MIN_ADDED:-80}"     # skip over-eng pass for tiny diffs
+MAX_INLINE_COMMENTS="${MAX_INLINE_COMMENTS:-8}"    # hard cap on live posts
 POST_DELAY=0.5
 BOX_W=58   # inner content width (between the side borders)
 
@@ -474,10 +475,32 @@ fetch_file_context() {
   : > "$TMPDIR_PT/file_context"
   : > "$TMPDIR_PT/file_list"
 
+  # Prefer substantive source files over lockfiles; rank by added-line count.
+  local ranked="$TMPDIR_PT/files_ranked"
+  : > "$ranked"
+  local cur="" adds=0
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^diff\ --git\ a/.+\ b/(.+)$ ]]; then
+      if [[ -n "$cur" ]]; then
+        printf '%08d\t%s\n' "$adds" "$cur" >> "$ranked"
+      fi
+      cur="${BASH_REMATCH[1]}"
+      adds=0
+      continue
+    fi
+    [[ "$line" =~ ^\+[^+] ]] && adds=$((adds + 1))
+  done < "$TMPDIR_PT/diff"
+  if [[ -n "$cur" ]]; then
+    printf '%08d\t%s\n' "$adds" "$cur" >> "$ranked"
+  fi
+
   local files=()
-  while IFS= read -r f; do
-    files+=("$f")
-  done < <(grep '^diff --git' "$TMPDIR_PT/diff" | sed 's|^diff --git a/.* b/||')
+  while IFS=$'\t' read -r _adds fpath; do
+    case "$fpath" in
+      go.sum|*/go.sum|package-lock.json|yarn.lock|pnpm-lock.yaml|*.min.js|*.pb.go) continue ;;
+    esac
+    files+=("$fpath")
+  done < <(sort -rn "$ranked")
 
   local fetched=0
   for fpath in "${files[@]}"; do
@@ -505,43 +528,42 @@ fetch_file_context() {
 
 # ── prompts ───────────────────────────────────────────────────────────
 
-# Shared anti-hallucination rules appended to every pass.
+# Shared anti-hallucination + evidence rules appended to every pass.
 _guardrails() {
 cat <<'GUARD'
 
-## Anti-hallucination rules (CRITICAL — read carefully)
+## Evidence rule (NON-NEGOTIABLE)
 
-- Do NOT claim a variable is "used once" or "unused" unless you can verify every
-  usage in the full file context provided. If no file context is provided for that
-  file, you CANNOT make usage-count claims.
-- Do NOT flag struct/API/type changes as regressions unless you have evidence
-  (from the file context) that callers use the old form. Speculative regressions
-  are worse than missing them.
-- Do NOT flag style preferences (variable naming, inlining, line count) as bugs.
-- If you cannot verify a claim from the diff + file context provided, do NOT
-  include it. When in doubt, skip the finding.
-- False positives erode trust faster than false negatives.
-- For a clean, well-written PR: returning [] is the correct and expected answer.
-  Do not invent findings to justify your existence.
-- Read the PR description (if provided) to understand the author's intent before
-  flagging something as wrong.
+Every finding MUST include:
+- "confidence": integer 1-10
+- "severity": "blocker" | "warning" | "nit"
+- "evidence": non-empty string array. Each entry MUST be a concrete pinpoint:
+  "path:line — what the code does that proves the claim"
+  The path:line MUST come from the provided diff or full file contents.
+  Quotes of the exact offending code are preferred.
 
-## Confidence scoring (required)
+FORBIDDEN (drop these — do not emit):
+- "may break", "could affect", "any code that depends on…", "callers might…"
+  without naming at least one concrete call site path:line from the provided context.
+- Flagging a deliberate, consistently applied migration (e.g. gorm.IsRecordNotFoundError
+  → errors.Is(err, gorm.ErrRecordNotFound) across the PR) as a regression when there is
+  no unmigrated leftover call site in the provided files.
+- Speculative connection-leak / logging / type-mismatch claims with no concrete broken consumer.
 
-Every finding MUST include a "confidence" field (integer 1-10):
-- 10: Certain bug / issue, verifiable from the code shown
-- 7-9: High confidence, clear evidence in the diff or file context
-- 4-6: Moderate, would need to see more code to be sure
-- 1-3: Speculative, based on assumptions about code not shown
+If you cannot pinpoint who/what breaks using the provided files → do NOT include the finding.
+False positives waste author time. Returning [] is correct and expected for clean PRs.
 
-Output format: [{"path":"...","line":N,"body":"...","confidence":N}]
-No issues → return []. No markdown fences. No explanation. Just the JSON array.
+## Output schema (ONLY this)
+
+[{"path":"...","line":N,"body":"...","confidence":N,"severity":"warning","evidence":["file.go:42 — …"],"impact":"one sentence: who breaks and how"}]
+
+No markdown fences. No explanation. Just the JSON array.
 GUARD
 }
 
 prompt_bugs() {
 cat <<'PROMPT'
-You review PR diffs for correctness bugs. Flag only clear, verifiable issues.
+You review PR diffs for correctness bugs. Flag only clear, VERIFIABLE issues.
 
 Look for:
 - Logic errors, off-by-one mistakes
@@ -554,40 +576,39 @@ Look for:
 
 Rules:
 - Only flag issues in ADDED lines (lines starting with + in the diff).
-- You are provided with full file contents alongside the diff. USE THEM to verify
-  your claims before including a finding.
-- "path" = file path from the diff header (after b/, e.g. "v1/services/order.go").
-- "line" = line number in the NEW version of the file (count from the + start in
-  the @@ hunk header).
-- "body" = 1-3 sentences. Name the variable, function, or condition concretely.
-- Read the code carefully: a default-value-then-conditional-override pattern
-  (e.g. x = A; if cond { x = B }) is NOT inverted logic.
+- Use the full file contents to verify claims before emitting.
+- "path" / "line" = NEW file location from the @@ hunk header.
+- "body" = 1-2 sentences naming the concrete bug (variable/condition/function).
+- "impact" = what fails at runtime if this ships.
+- Default-then-override (x = A; if cond { x = B }) is NOT inverted logic.
+- severity: blocker for crash/wrong data; warning for likely bugs; never "nit" for bugs.
 PROMPT
   _guardrails
 }
 
 prompt_regression() {
 cat <<'PROMPT'
-You review PR diffs for regression risk to existing callers and downstream systems.
+You review PR diffs for regression risk to EXISTING callers.
 
-Flag ONLY regressions you can verify from the provided code context:
-- Breaking API changes (removed/renamed fields, changed types, new required params)
-  BUT ONLY if you can see callers using the old form in the file context.
-- New required config/env vars (missing → runtime crash)
-- Changed validation that rejects previously accepted input
-- Changed timeouts, retry behavior, or circuit breaker thresholds
-- Removed fallback behavior
-- Changed error codes or HTTP status codes that callers may match on
+A regression finding is ONLY valid if you can show a concrete broken consumer.
+
+Flag ONLY when you can cite evidence of a break:
+- Removed/renamed/changed return types that a caller in the provided files still assumes
+- New required params/fields where a caller in the provided files still uses the old form
+- Behavior change where you can quote the caller path that depends on the old behavior
+- Unmigrated leftover using the OLD API while the NEW API is introduced (cite both)
+
+Do NOT flag:
+- Intentional library upgrades applied consistently (helpers swapped everywhere in-PR)
+- Theoretical "32-bit int overflow" / "any code depending on…" without a cited call site
+- "logging may differ" / "error type checking will break" without naming the broken checker
 
 Rules:
-- Flag issues in CHANGED lines (+ or - in the diff).
 - Prefix body with "**Regression:** ".
-- "path" = file path from the diff header.
-- "line" = line number in the NEW version of the file.
-- "body" = 1-3 sentences explaining what existing behavior changes and who is affected.
-- Adding a new optional field to a struct (especially with json tags) is NOT a
-  regression if the language uses named-field initialization (Go, Python, etc.).
-  Only flag if you can see positional initialization in the provided context.
+- "evidence" MUST include ≥1 consumer path:line (not just the changed line itself).
+  The changed line alone is not evidence of breakage — show who still depends on the old contract.
+- If the entire PR migrates callers together and nothing unmigrated remains → return [].
+- severity: blocker if compile/runtime break is proven; warning if behavior change is proven.
 PROMPT
   _guardrails
 }
@@ -636,22 +657,17 @@ $skill
 
 ## CLI output contract (required)
 
-You are reviewing a GitHub PR diff (unified diff).
-You are also given the full file contents for context — USE THEM to verify claims.
+You are reviewing a GitHub PR diff (unified diff) plus full file contents.
 Apply the ponytail-review rules above to ADDED lines only (+ lines).
 
-Emit findings as a JSON array for inline comments:
-[{"path":"...","line":N,"body":"<tag>: <what>. <replacement or nothing>. (-N lines)","confidence":N}]
+Emit findings as a JSON array:
+[{"path":"...","line":N,"body":"<tag>: <what>. <replacement>. (-N lines)","confidence":N,"severity":"nit","evidence":["path:line — …"],"impact":"why the shorter form is safe"}]
 
-- "path" = file path from the diff header (after b/).
-- "line" = line number in the NEW file (from the @@ hunk header).
-- "body" = one finding in the skill's tag style (delete/stdlib/native/yagni/shrink).
-- "confidence" = 1-10 (10 = certain, 7+ = high, below 7 = speculative).
-- Do not flag variables as "used once" unless you can count usages in the full file.
-- Readability-motivated intermediate variables are NOT yagni — only flag if the
-  variable is truly dead or the abstraction has zero callers.
+- Use full files to verify "used once" / "one caller" claims. Cite evidence.
+- Readability intermediate vars are NOT yagni.
+- Do not flag consistent library migrations as over-engineering.
 - Nothing to cut → return [].
-- Return ONLY the JSON array. No markdown fences. No explanation.
+- Return ONLY the JSON array. No markdown fences.
 PROMPT
 }
 
@@ -695,16 +711,18 @@ _model_for_pass() {
 
 run_ai_anthropic() {
   local system_prompt="$1" pass_name="$2" model="$3"
+  local user_content
+  user_content=$(cat "$TMPDIR_PT/prompt.txt")
 
   jq -n \
     --arg system "$system_prompt" \
-    --rawfile diff "$TMPDIR_PT/diff" \
+    --arg user "$user_content" \
     --arg model "$model" \
     '{
       model: $model,
       max_tokens: 8192,
       system: $system,
-      messages: [{role: "user", content: ("Review this PR diff:\n\n" + $diff)}]
+      messages: [{role: "user", content: $user}]
     }' > "$TMPDIR_PT/payload.json"
 
   local response
@@ -786,16 +804,47 @@ run_ai() {
   extract_json_array "$text"
 }
 
-# ── confidence filter ────────────────────────────────────────────────
-filter_by_confidence() {
+# ── quality filters ──────────────────────────────────────────────────
+# Drop weak findings: low confidence, missing evidence, or hand-wavy language.
+filter_findings() {
   local input="$1"
-  echo "$input" | jq --argjson thresh "$CONFIDENCE_THRESHOLD" \
-    '[.[] | select((.confidence // 10) >= $thresh)]'
+  local jqprog
+  # ponytail: jq program in a heredoc so bash quoting doesn't fight $vars inside.
+  jqprog=$(cat <<'JQ'
+    def speculative:
+      ((.body // "") + " " + (.impact // ""))
+      | test("(?i)\\b(may|might|could|possibly|potentially)\\b|any code |depending on|will break|can break|may have|could cause|could affect"; "i");
+    def pinpoint:
+      test("^[A-Za-z0-9_./\\\\-]+:[0-9]+(\\s|[-]|$)");
+    def has_evidence:
+      (.evidence | type == "array") and (.evidence | length > 0)
+      and all(.evidence[]; type == "string" and length > 12 and pinpoint);
+    # Regression claims must cite a consumer outside the changed line's own path.
+    def has_consumer_evidence:
+      (.path as $p |
+        [.evidence[]? | select((startswith($p + ":") | not) and pinpoint)]
+        | length > 0);
+    def is_regression:
+      ((.body // "") | test("(?i)regression"));
+    [
+      .[]
+      | select((.confidence // 0) >= $thresh)
+      | select(has_evidence)
+      | select(speculative | not)
+      | select((is_regression | not) or has_consumer_evidence)
+      | select(
+          (.severity == "blocker")
+          or (.severity == "warning")
+          or (.severity == "nit")
+        )
+    ]
+JQ
+)
+  echo "$input" | jq --argjson thresh "$CONFIDENCE_THRESHOLD" "$jqprog"
 }
 
 # ── verification pass ────────────────────────────────────────────────
-# Second AI call that receives the findings + file context and prunes
-# false positives. Uses the cheaper/default model.
+# Second AI call: keep only findings with verifiable pinpoints.
 verify_findings() {
   local findings_json="$1"
   local count
@@ -804,21 +853,22 @@ verify_findings() {
 
   local verify_prompt
   verify_prompt=$(cat <<'VPROMPT'
-You are a code review verifier. You receive a list of review findings and the
-full file contents they reference. Your job is to REMOVE false positives.
+You are a strict code-review verifier. Remove false positives and hand-wavy claims.
 
-For each finding, check:
-1. Is the claimed issue actually present in the code? Read the full file to verify.
-2. Does the finding make incorrect claims about variable usage counts, logic flow,
-   or caller patterns?
-3. Is the finding a style nitpick rather than a real issue?
+For EACH finding, keep it ONLY if ALL of these are true:
+1. The claim is actually true in the provided file contents / diff.
+2. "evidence" pinpoints real path:line locations that prove the claim.
+3. For regression: evidence includes a concrete CONSUMER (caller) that breaks —
+   not just the changed line itself. Intentional, consistently applied migrations
+   (e.g. GORM v1→v2 helper replacements applied throughout the PR) are NOT
+   regressions unless an unmigrated leftover call site is cited.
+4. The body does not rely on vague "may/might/could/any code depending on…"
+   without cited call sites.
 
-Return ONLY the findings that are genuinely correct. Do not modify their content,
-just filter out the wrong ones.
+Drop style nits. Drop speculative type/leak/logging claims without proof.
 
-Return a JSON array with the surviving findings (same schema as input).
-If all findings are false positives, return [].
-No markdown fences. No explanation. Just the JSON array.
+Return ONLY the surviving findings as a JSON array (same schema).
+If none survive → []. No markdown fences. No explanation.
 VPROMPT
 )
 
@@ -832,6 +882,9 @@ VPROMPT
   printf '\n\n## Diff:\n\n' >> "$verify_input"
   cat "$TMPDIR_PT/diff" >> "$verify_input"
 
+  # Reuse the same user payload path Anthropic/Cursor expect for verify.
+  cp "$verify_input" "$TMPDIR_PT/prompt.txt"
+
   export _PT_PROMPT_FILE="$verify_input"
   export _PT_PASS="verify"
   export _PT_MODEL="$CURSOR_MODEL"
@@ -843,7 +896,10 @@ VPROMPT
   esac
 
   unset _PT_PROMPT_FILE _PT_PASS _PT_MODEL
-  extract_json_array "$text"
+  local verified
+  verified=$(extract_json_array "$text")
+  # Re-apply hard filters after the model — never trust a soft keep.
+  filter_findings "$verified"
 }
 
 # ── run passes ────────────────────────────────────────────────────────
@@ -870,13 +926,13 @@ run_passes() {
     prompt=$("prompt_${pass}")
     findings=$(run_ai "$prompt" "$pass")
     raw_count=$(echo "$findings" | jq 'length')
-    findings=$(filter_by_confidence "$findings")
+    findings=$(filter_findings "$findings")
     count=$(echo "$findings" | jq 'length')
     printf "\r\033[K"
     if [[ "$count" -eq 0 ]]; then
       if (( raw_count > 0 )); then
-        printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s ${BGRN}clean${RST} ${MUTE}(%d below confidence ≥%s)${RST}\n" \
-          "$idx" "$total" "$clr" "$RST" "$label" "$raw_count" "$CONFIDENCE_THRESHOLD"
+        printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s ${BGRN}clean${RST} ${MUTE}(%d filtered: low confidence / no evidence)${RST}\n" \
+          "$idx" "$total" "$clr" "$RST" "$label" "$raw_count"
       else
         printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s ${BGRN}clean${RST}\n" \
           "$idx" "$total" "$clr" "$RST" "$label"
@@ -884,7 +940,7 @@ run_passes() {
     else
       local dropped=$((raw_count - count))
       if (( dropped > 0 )); then
-        printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s %s%d finding(s)%s ${MUTE}(%d dropped)${RST}\n" \
+        printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s %s%d finding(s)%s ${MUTE}(%d filtered)${RST}\n" \
           "$idx" "$total" "$clr" "$RST" "$label" "$clr" "$count" "$RST" "$dropped"
       else
         printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s %s%d finding(s)%s\n" \
@@ -925,12 +981,66 @@ dedup_findings() {
   jq '
     group_by(.path + ":" + (.line|tostring))
     | map({
-        path:  .[0].path,
-        line:  .[0].line,
-        body:  (map(.body) | join("\n\n")),
-        tags:  (map(.tag) | unique | join(", "))
+        path:       .[0].path,
+        line:       .[0].line,
+        body:       (map(.body) | unique | join("\n\n")),
+        tags:       (map(.tag) | unique | join(", ")),
+        severity:   (map(.severity // "warning") | unique | join(", ")),
+        confidence: (map(.confidence // 0) | max),
+        evidence:   (map(.evidence // []) | add | unique),
+        impact:     (map(.impact // "") | map(select(length > 0)) | unique | join(" "))
       })
+    | sort_by(
+        (if .severity | test("blocker") then 0
+         elif .severity | test("warning") then 1
+         else 2 end),
+        -(.confidence // 0)
+      )
   ' "$TMPDIR_PT/findings.json" > "$TMPDIR_PT/deduped.json"
+
+  # Hard cap so we never spam the PR.
+  local total
+  total=$(jq 'length' "$TMPDIR_PT/deduped.json")
+  if (( total > MAX_INLINE_COMMENTS )); then
+    info "capping ${total} findings → ${MAX_INLINE_COMMENTS} highest-severity"
+    jq --argjson n "$MAX_INLINE_COMMENTS" '.[0:$n]' \
+      "$TMPDIR_PT/deduped.json" > "$TMPDIR_PT/deduped.t"
+    mv "$TMPDIR_PT/deduped.t" "$TMPDIR_PT/deduped.json"
+  fi
+}
+
+# Render a review comment that pinpoints evidence for the author.
+format_comment_body() {
+  local tags="$1" severity="$2" confidence="$3" body="$4" impact="$5"
+  local evidence_json="$6"
+
+  local sev_label
+  case "$severity" in
+    *blocker*) sev_label="blocker" ;;
+    *warning*) sev_label="warning" ;;
+    *)         sev_label="note" ;;
+  esac
+
+  local out=""
+  out+="**[${tags}]** · ${sev_label} · confidence ${confidence}"
+  out+=$'\n\n'
+  out+="$body"
+  if [[ -n "$impact" ]]; then
+    out+=$'\n\n'
+    out+="**Impact:** ${impact}"
+  fi
+
+  local evidence_md
+  evidence_md=$(echo "$evidence_json" | jq -r '
+    if type == "array" and length > 0 then
+      "**Evidence:**\n" + (map("- `" + . + "`") | join("\n"))
+    else empty end
+  ')
+  if [[ -n "$evidence_md" ]]; then
+    out+=$'\n\n'
+    out+="$evidence_md"
+  fi
+  printf '%s' "$out"
 }
 
 # ── post comments ────────────────────────────────────────────────────
@@ -949,12 +1059,16 @@ post_findings() {
 
   while IFS= read -r row; do
     n=$((n + 1))
-    local path line body tags full_body first_tag clr
+    local path line body tags severity confidence impact evidence full_body first_tag clr
     path=$(echo "$row" | jq -r '.path')
     line=$(echo "$row" | jq -r '.line')
     body=$(echo "$row" | jq -r '.body')
     tags=$(echo "$row" | jq -r '.tags')
-    full_body="[$tags] $body"
+    severity=$(echo "$row" | jq -r '.severity // "warning"')
+    confidence=$(echo "$row" | jq -r '.confidence // 0')
+    impact=$(echo "$row" | jq -r '.impact // ""')
+    evidence=$(echo "$row" | jq -c '.evidence // []')
+    full_body=$(format_comment_body "$tags" "$severity" "$confidence" "$body" "$impact" "$evidence")
 
     first_tag="${tags%%,*}"
     first_tag="${first_tag## }"
@@ -964,10 +1078,10 @@ post_findings() {
       local loc="${path}:${line}"
       (( ${#loc} > BOX_W )) && loc="${loc:0:$((BOX_W-1))}…"
       box_top "finding"
-      printf "  ${ACC}│${RST} ${clr}%-${BOX_W}s${RST} ${ACC}│${RST}\n" "[$tags]"
+      printf "  ${ACC}│${RST} ${clr}%-${BOX_W}s${RST} ${ACC}│${RST}\n" "[$tags] $severity c${confidence}"
       box_row "$loc"
       box_sep
-      echo "$body" | fold -s -w "$BOX_W" | while IFS= read -r bline; do
+      echo "$full_body" | fold -s -w "$BOX_W" | while IFS= read -r bline; do
         box_row "$bline"
       done
       box_bot
