@@ -4,7 +4,7 @@
 #        ponytail setup             check dependencies and configuration
 set -euo pipefail
 
-VERSION="2.2.0"
+VERSION="2.2.1"
 
 # ── colors (disabled when piped) ──────────────────────────────────────
 # Soft 256-color accents when the terminal supports them; else basic ANSI.
@@ -35,11 +35,10 @@ fi
 
 # ── config ────────────────────────────────────────────────────────────
 CURSOR_MODEL="${CURSOR_MODEL:-claude-sonnet-4}"
-# ponytail: per-pass model — use a stronger model for bugs/regression where
-# reasoning depth matters; falls back to CURSOR_MODEL if unset.
-CURSOR_MODEL_REVIEW="${CURSOR_MODEL_REVIEW:-${CURSOR_MODEL}}"
+# Stronger model for bugs/regression (reasoning). Override with CURSOR_MODEL_REVIEW.
+CURSOR_MODEL_REVIEW="${CURSOR_MODEL_REVIEW:-claude-opus-4-6}"
 ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}"
-ANTHROPIC_MODEL_REVIEW="${ANTHROPIC_MODEL_REVIEW:-${ANTHROPIC_MODEL}}"
+ANTHROPIC_MODEL_REVIEW="${ANTHROPIC_MODEL_REVIEW:-claude-opus-4-6}"
 MAX_DIFF_BYTES=150000
 MAX_FILE_BYTES=50000         # per-file cap when fetching full context
 MAX_CONTEXT_FILES="${MAX_CONTEXT_FILES:-20}"       # fetch at most this many changed files
@@ -306,12 +305,18 @@ cmd_setup() {
   if [[ -n "${CURSOR_API_KEY:-}" ]]; then
     has_cursor=true
     ok "CURSOR_API_KEY" "set ${DIM}(Cursor engine)${RST}"
+    ok "review model" "${CURSOR_MODEL_REVIEW} ${DIM}(bugs/regression)${RST}"
+    ok "other model" "${CURSOR_MODEL} ${DIM}(ponytail/verify)${RST}"
   else
     warn "CURSOR_API_KEY" "not set"
   fi
   if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
     has_anthropic=true
     ok "ANTHROPIC_API_KEY" "set ${DIM}(Anthropic fallback)${RST}"
+    if ! $has_cursor; then
+      ok "review model" "${ANTHROPIC_MODEL_REVIEW} ${DIM}(bugs/regression)${RST}"
+      ok "other model" "${ANTHROPIC_MODEL} ${DIM}(ponytail/verify)${RST}"
+    fi
   else
     warn "ANTHROPIC_API_KEY" "not set"
   fi
@@ -465,6 +470,11 @@ fetch_pr() {
   echo "  ${CYN}${HEAD_BRANCH}${RST}  ${DIM}→${RST}  ${GRN}${BASE_BRANCH}${RST}"
   echo "  ${DIM}commit${RST} ${COMMIT:0:12}   ${DIM}diff${RST} ${human_sz}   ${DIM}+lines${RST} ${ADDED_LINES}   ${DIM}files${RST} ${ctx_count}"
   echo "  ${DIM}engine${RST} ${AI_ENGINE}   ${DIM}confidence${RST} ≥${CONFIDENCE_THRESHOLD}   ${DIM}mode${RST} ${mode}"
+  if [[ "$AI_ENGINE" == "cursor" ]]; then
+    echo "  ${DIM}model${RST} review=${CURSOR_MODEL_REVIEW}   other=${CURSOR_MODEL}"
+  else
+    echo "  ${DIM}model${RST} review=${ANTHROPIC_MODEL_REVIEW}   other=${ANTHROPIC_MODEL}"
+  fi
   echo ""
   hr
   echo ""

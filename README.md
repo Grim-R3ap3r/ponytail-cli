@@ -3,7 +3,7 @@
 AI-powered PR review CLI. Three review passes in one command — **bugs**, **regression risk**, and **over-engineering**.
 
 ```
-   ╭─╮ ponytail  v2.2.0
+   ╭─╮ ponytail  v2.2.1
    ╰─╯ lazy senior reviews
 
   Commands
@@ -84,10 +84,10 @@ ponytail setup                             # check dependencies & config
 |----------|-------------|
 | `CURSOR_API_KEY` | Cursor SDK API key (preferred engine) |
 | `ANTHROPIC_API_KEY` | Anthropic API key (curl fallback) |
-| `CURSOR_MODEL` | Model for Cursor SDK (default: `claude-sonnet-4`) |
-| `CURSOR_MODEL_REVIEW` | Model for bugs/regression passes — use a stronger model here (default: same as `CURSOR_MODEL`) |
-| `ANTHROPIC_MODEL` | Model for Anthropic (default: `claude-sonnet-4-20250514`) |
-| `ANTHROPIC_MODEL_REVIEW` | Model for bugs/regression passes via Anthropic (default: same as `ANTHROPIC_MODEL`) |
+| `CURSOR_MODEL` | Model for ponytail/verify passes (default: `claude-sonnet-4`) |
+| `CURSOR_MODEL_REVIEW` | Model for bugs/regression (default: `claude-opus-4-6`) |
+| `ANTHROPIC_MODEL` | Model for Anthropic ponytail/verify (default: `claude-sonnet-4-20250514`) |
+| `ANTHROPIC_MODEL_REVIEW` | Model for Anthropic bugs/regression (default: `claude-opus-4-6`) |
 | `CONFIDENCE_THRESHOLD` | Minimum confidence (1-10) to post a finding (default: `7`) |
 | `PONYTAIL_MIN_ADDED` | Skip the over-engineering pass when added lines are below this (default: `80`) |
 | `MAX_CONTEXT_FILES` | Max changed files to fetch full contents for (default: `20`) |
