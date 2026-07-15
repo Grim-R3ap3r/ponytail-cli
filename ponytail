@@ -4,7 +4,7 @@
 #        ponytail setup             check dependencies and configuration
 set -euo pipefail
 
-VERSION="1.1.3"
+VERSION="2.0.0"
 
 # ── colors (disabled when piped) ──────────────────────────────────────
 # Soft 256-color accents when the terminal supports them; else basic ANSI.
@@ -35,8 +35,16 @@ fi
 
 # ── config ────────────────────────────────────────────────────────────
 CURSOR_MODEL="${CURSOR_MODEL:-claude-sonnet-4}"
+# ponytail: per-pass model — use a stronger model for bugs/regression where
+# reasoning depth matters; falls back to CURSOR_MODEL if unset.
+CURSOR_MODEL_REVIEW="${CURSOR_MODEL_REVIEW:-${CURSOR_MODEL}}"
 ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}"
+ANTHROPIC_MODEL_REVIEW="${ANTHROPIC_MODEL_REVIEW:-${ANTHROPIC_MODEL}}"
 MAX_DIFF_BYTES=150000
+MAX_FILE_BYTES=50000         # per-file cap when fetching full context
+MAX_CONTEXT_FILES=8          # fetch at most this many changed files
+CONFIDENCE_THRESHOLD="${CONFIDENCE_THRESHOLD:-7}"  # 1-10; drop findings below this
+PONYTAIL_MIN_ADDED="${PONYTAIL_MIN_ADDED:-80}"     # skip over-eng pass for tiny diffs
 POST_DELAY=0.5
 BOX_W=58   # inner content width (between the side borders)
 
@@ -46,6 +54,9 @@ REPO=""
 COMMIT=""
 HEAD_BRANCH=""
 BASE_BRANCH=""
+PR_TITLE=""
+PR_BODY=""
+ADDED_LINES=0
 DRY_RUN=false
 PASSES=()
 TMPDIR_PT=""
@@ -411,14 +422,14 @@ parse_review_args() {
 fetch_pr() {
   local pr_json
   pr_json=$(gh pr view "$PR" --repo "$REPO" \
-    --json headRefOid,headRefName,baseRefName,title 2>/dev/null) \
+    --json headRefOid,headRefName,baseRefName,title,body 2>/dev/null) \
     || die "can't read PR #${PR} in ${REPO}"
 
   COMMIT=$(echo "$pr_json" | jq -r '.headRefOid')
   HEAD_BRANCH=$(echo "$pr_json" | jq -r '.headRefName')
   BASE_BRANCH=$(echo "$pr_json" | jq -r '.baseRefName')
-  local title
-  title=$(echo "$pr_json" | jq -r '.title')
+  PR_TITLE=$(echo "$pr_json" | jq -r '.title // ""')
+  PR_BODY=$(echo "$pr_json" | jq -r '.body // ""')
 
   gh pr diff "$PR" --repo "$REPO" > "$TMPDIR_PT/diff"
   local sz
@@ -430,31 +441,107 @@ fetch_pr() {
     mv "$TMPDIR_PT/diff.t" "$TMPDIR_PT/diff"
   fi
 
+  ADDED_LINES=$(grep -c '^+[^+]' "$TMPDIR_PT/diff" 2>/dev/null || echo 0)
+
+  fetch_file_context
+
   local human_sz
   if (( sz >= 1024 )); then
     human_sz="$(( sz / 1024 ))KB"
   else
     human_sz="${sz}B"
   fi
+  local ctx_count
+  ctx_count=$(wc -l < "$TMPDIR_PT/file_list" 2>/dev/null | tr -d ' ')
+  [[ -z "$ctx_count" ]] && ctx_count=0
 
   local mode="${BGRN}live${RST}"
   $DRY_RUN && mode="${BYLW}dry-run${RST}"
 
-  echo "  ${B}#${PR}${RST}  ${title}"
+  echo "  ${B}#${PR}${RST}  ${PR_TITLE}"
   echo "  ${DIM}${REPO}${RST}"
   echo ""
   echo "  ${CYN}${HEAD_BRANCH}${RST}  ${DIM}→${RST}  ${GRN}${BASE_BRANCH}${RST}"
-  echo "  ${DIM}commit${RST} ${COMMIT:0:12}   ${DIM}diff${RST} ${human_sz}   ${DIM}engine${RST} ${AI_ENGINE}   ${DIM}mode${RST} ${mode}"
+  echo "  ${DIM}commit${RST} ${COMMIT:0:12}   ${DIM}diff${RST} ${human_sz}   ${DIM}+lines${RST} ${ADDED_LINES}   ${DIM}files${RST} ${ctx_count}"
+  echo "  ${DIM}engine${RST} ${AI_ENGINE}   ${DIM}confidence${RST} ≥${CONFIDENCE_THRESHOLD}   ${DIM}mode${RST} ${mode}"
   echo ""
   hr
   echo ""
 }
 
+# ── fetch full file context ──────────────────────────────────────────
+fetch_file_context() {
+  : > "$TMPDIR_PT/file_context"
+  : > "$TMPDIR_PT/file_list"
+
+  local files=()
+  while IFS= read -r f; do
+    files+=("$f")
+  done < <(grep '^diff --git' "$TMPDIR_PT/diff" | sed 's|^diff --git a/.* b/||')
+
+  local fetched=0
+  for fpath in "${files[@]}"; do
+    (( fetched >= MAX_CONTEXT_FILES )) && break
+    local content
+    content=$(gh api "repos/$REPO/contents/${fpath}?ref=${HEAD_BRANCH}" \
+      -q '.content' 2>/dev/null || true)
+    [[ -z "$content" ]] && continue
+    local decoded
+    decoded=$(echo "$content" | base64 -d 2>/dev/null || true)
+    [[ -z "$decoded" ]] && continue
+    local fsz=${#decoded}
+    if (( fsz > MAX_FILE_BYTES )); then
+      decoded="${decoded:0:$MAX_FILE_BYTES}
+... (truncated at ${MAX_FILE_BYTES}B)"
+    fi
+    printf '\n--- FILE: %s ---\n%s\n' "$fpath" "$decoded" >> "$TMPDIR_PT/file_context"
+    echo "$fpath" >> "$TMPDIR_PT/file_list"
+    fetched=$((fetched + 1))
+  done
+  if (( fetched > 0 )); then
+    info "fetched ${fetched} file(s) for context"
+  fi
+}
+
 # ── prompts ───────────────────────────────────────────────────────────
+
+# Shared anti-hallucination rules appended to every pass.
+_guardrails() {
+cat <<'GUARD'
+
+## Anti-hallucination rules (CRITICAL — read carefully)
+
+- Do NOT claim a variable is "used once" or "unused" unless you can verify every
+  usage in the full file context provided. If no file context is provided for that
+  file, you CANNOT make usage-count claims.
+- Do NOT flag struct/API/type changes as regressions unless you have evidence
+  (from the file context) that callers use the old form. Speculative regressions
+  are worse than missing them.
+- Do NOT flag style preferences (variable naming, inlining, line count) as bugs.
+- If you cannot verify a claim from the diff + file context provided, do NOT
+  include it. When in doubt, skip the finding.
+- False positives erode trust faster than false negatives.
+- For a clean, well-written PR: returning [] is the correct and expected answer.
+  Do not invent findings to justify your existence.
+- Read the PR description (if provided) to understand the author's intent before
+  flagging something as wrong.
+
+## Confidence scoring (required)
+
+Every finding MUST include a "confidence" field (integer 1-10):
+- 10: Certain bug / issue, verifiable from the code shown
+- 7-9: High confidence, clear evidence in the diff or file context
+- 4-6: Moderate, would need to see more code to be sure
+- 1-3: Speculative, based on assumptions about code not shown
+
+Output format: [{"path":"...","line":N,"body":"...","confidence":N}]
+No issues → return []. No markdown fences. No explanation. Just the JSON array.
+GUARD
+}
 
 prompt_bugs() {
 cat <<'PROMPT'
-You review PR diffs for correctness bugs. Flag only clear issues, not style preferences.
+You review PR diffs for correctness bugs. Flag only clear, verifiable issues.
 
 Look for:
 - Logic errors, off-by-one mistakes
@@ -467,21 +554,25 @@ Look for:
 
 Rules:
 - Only flag issues in ADDED lines (lines starting with + in the diff).
+- You are provided with full file contents alongside the diff. USE THEM to verify
+  your claims before including a finding.
 - "path" = file path from the diff header (after b/, e.g. "v1/services/order.go").
-- "line" = line number in the NEW version of the file (count from the + start in the @@ hunk header).
+- "line" = line number in the NEW version of the file (count from the + start in
+  the @@ hunk header).
 - "body" = 1-3 sentences. Name the variable, function, or condition concretely.
-
-Return ONLY a JSON array: [{"path":"...","line":N,"body":"..."}]
-No issues → return [].  No markdown fences. No explanation. Just the JSON.
+- Read the code carefully: a default-value-then-conditional-override pattern
+  (e.g. x = A; if cond { x = B }) is NOT inverted logic.
 PROMPT
+  _guardrails
 }
 
 prompt_regression() {
 cat <<'PROMPT'
 You review PR diffs for regression risk to existing callers and downstream systems.
 
-Flag:
+Flag ONLY regressions you can verify from the provided code context:
 - Breaking API changes (removed/renamed fields, changed types, new required params)
+  BUT ONLY if you can see callers using the old form in the file context.
 - New required config/env vars (missing → runtime crash)
 - Changed validation that rejects previously accepted input
 - Changed timeouts, retry behavior, or circuit breaker thresholds
@@ -494,10 +585,11 @@ Rules:
 - "path" = file path from the diff header.
 - "line" = line number in the NEW version of the file.
 - "body" = 1-3 sentences explaining what existing behavior changes and who is affected.
-
-Return ONLY a JSON array: [{"path":"...","line":N,"body":"..."}]
-No issues → return [].  No markdown fences. No explanation. Just the JSON.
+- Adding a new optional field to a struct (especially with json tags) is NOT a
+  regression if the language uses named-field initialization (Go, Python, etc.).
+  Only flag if you can see positional initialization in the provided context.
 PROMPT
+  _guardrails
 }
 
 # Resolve /ponytail-review skill (same content as Cursor's skill).
@@ -539,23 +631,25 @@ prompt_ponytail() {
   fi
   skill=$(skill_body "$skill_file")
 
-  # Skill is the source of truth (/ponytail-review). Adapter maps its
-  # one-line findings into the CLI's JSON comment schema.
   cat <<PROMPT
 $skill
 
 ## CLI output contract (required)
 
 You are reviewing a GitHub PR diff (unified diff).
+You are also given the full file contents for context — USE THEM to verify claims.
 Apply the ponytail-review rules above to ADDED lines only (+ lines).
 
 Emit findings as a JSON array for inline comments:
-[{"path":"...","line":N,"body":"<tag>: <what>. <replacement or nothing>. (-N lines)"}]
+[{"path":"...","line":N,"body":"<tag>: <what>. <replacement or nothing>. (-N lines)","confidence":N}]
 
 - "path" = file path from the diff header (after b/).
 - "line" = line number in the NEW file (from the @@ hunk header).
 - "body" = one finding in the skill's tag style (delete/stdlib/native/yagni/shrink).
-- Do not include the trailing "net: -N" line in JSON; fold line savings into each body as (-N lines).
+- "confidence" = 1-10 (10 = certain, 7+ = high, below 7 = speculative).
+- Do not flag variables as "used once" unless you can count usages in the full file.
+- Readability-motivated intermediate variables are NOT yagni — only flag if the
+  variable is truly dead or the abstraction has zero callers.
 - Nothing to cut → return [].
 - Return ONLY the JSON array. No markdown fences. No explanation.
 PROMPT
@@ -582,13 +676,30 @@ extract_json_array() {
 
 # ── AI calls ──────────────────────────────────────────────────────────
 
+# Resolve per-pass model: bugs/regression use the _REVIEW variant.
+_model_for_pass() {
+  local pass="$1"
+  case "$AI_ENGINE" in
+    cursor)
+      case "$pass" in
+        bugs|regression) echo "$CURSOR_MODEL_REVIEW" ;;
+        *)               echo "$CURSOR_MODEL" ;;
+      esac ;;
+    anthropic)
+      case "$pass" in
+        bugs|regression) echo "$ANTHROPIC_MODEL_REVIEW" ;;
+        *)               echo "$ANTHROPIC_MODEL" ;;
+      esac ;;
+  esac
+}
+
 run_ai_anthropic() {
-  local system_prompt="$1" pass_name="$2"
+  local system_prompt="$1" pass_name="$2" model="$3"
 
   jq -n \
     --arg system "$system_prompt" \
     --rawfile diff "$TMPDIR_PT/diff" \
-    --arg model "$ANTHROPIC_MODEL" \
+    --arg model "$model" \
     '{
       model: $model,
       max_tokens: 8192,
@@ -612,7 +723,7 @@ run_ai_anthropic() {
 }
 
 run_ai_cursor() {
-  local system_prompt="$1" pass_name="$2"
+  local system_prompt="$1" pass_name="$2" model="$3"
 
   NODE_PATH=$(npm root -g) NODE_NO_WARNINGS=1 node -e "
     const { Agent } = require('@cursor/sdk');
@@ -633,18 +744,102 @@ run_ai_cursor() {
   "
 }
 
+# Build the user message: PR metadata + diff + file context.
+_build_user_prompt() {
+  local out="$TMPDIR_PT/prompt.txt"
+  : > "$out"
+
+  if [[ -n "$PR_TITLE" || -n "$PR_BODY" ]]; then
+    printf '## PR description\n\n**%s**\n\n%s\n\n' "$PR_TITLE" "$PR_BODY" >> "$out"
+  fi
+
+  printf '## Diff\n\n' >> "$out"
+  cat "$TMPDIR_PT/diff" >> "$out"
+
+  if [[ -s "$TMPDIR_PT/file_context" ]]; then
+    printf '\n\n## Full file contents (for verification — use these to confirm your claims)\n' >> "$out"
+    cat "$TMPDIR_PT/file_context" >> "$out"
+  fi
+}
+
 run_ai() {
   local system_prompt="$1" pass_name="$2" text
+  local model
+  model=$(_model_for_pass "$pass_name")
 
-  printf '%s\n\nReview this PR diff:\n\n' "$system_prompt" > "$TMPDIR_PT/prompt.txt"
-  cat "$TMPDIR_PT/diff" >> "$TMPDIR_PT/prompt.txt"
-  export _PT_PROMPT_FILE="$TMPDIR_PT/prompt.txt"
+  printf '%s\n\nReview this PR:\n\n' "$system_prompt" > "$TMPDIR_PT/system.txt"
+  _build_user_prompt
+  # For Cursor SDK: system + user go into one file
+  local combined="$TMPDIR_PT/combined_prompt.txt"
+  cat "$TMPDIR_PT/system.txt" "$TMPDIR_PT/prompt.txt" > "$combined"
+
+  export _PT_PROMPT_FILE="$combined"
   export _PT_PASS="$pass_name"
-  export _PT_MODEL="$CURSOR_MODEL"
+  export _PT_MODEL="$model"
 
   case "$AI_ENGINE" in
-    cursor)    text=$(run_ai_cursor "$system_prompt" "$pass_name") ;;
-    anthropic) text=$(run_ai_anthropic "$system_prompt" "$pass_name") ;;
+    cursor)    text=$(run_ai_cursor "$system_prompt" "$pass_name" "$model") ;;
+    anthropic) text=$(run_ai_anthropic "$system_prompt" "$pass_name" "$model") ;;
+  esac
+
+  unset _PT_PROMPT_FILE _PT_PASS _PT_MODEL
+  extract_json_array "$text"
+}
+
+# ── confidence filter ────────────────────────────────────────────────
+filter_by_confidence() {
+  local input="$1"
+  echo "$input" | jq --argjson thresh "$CONFIDENCE_THRESHOLD" \
+    '[.[] | select((.confidence // 10) >= $thresh)]'
+}
+
+# ── verification pass ────────────────────────────────────────────────
+# Second AI call that receives the findings + file context and prunes
+# false positives. Uses the cheaper/default model.
+verify_findings() {
+  local findings_json="$1"
+  local count
+  count=$(echo "$findings_json" | jq 'length')
+  (( count == 0 )) && { echo "$findings_json"; return; }
+
+  local verify_prompt
+  verify_prompt=$(cat <<'VPROMPT'
+You are a code review verifier. You receive a list of review findings and the
+full file contents they reference. Your job is to REMOVE false positives.
+
+For each finding, check:
+1. Is the claimed issue actually present in the code? Read the full file to verify.
+2. Does the finding make incorrect claims about variable usage counts, logic flow,
+   or caller patterns?
+3. Is the finding a style nitpick rather than a real issue?
+
+Return ONLY the findings that are genuinely correct. Do not modify their content,
+just filter out the wrong ones.
+
+Return a JSON array with the surviving findings (same schema as input).
+If all findings are false positives, return [].
+No markdown fences. No explanation. Just the JSON array.
+VPROMPT
+)
+
+  local verify_input="$TMPDIR_PT/verify_prompt.txt"
+  printf '%s\n\n## Findings to verify:\n\n%s\n\n' "$verify_prompt" "$findings_json" > "$verify_input"
+
+  if [[ -s "$TMPDIR_PT/file_context" ]]; then
+    printf '## Full file contents:\n' >> "$verify_input"
+    cat "$TMPDIR_PT/file_context" >> "$verify_input"
+  fi
+  printf '\n\n## Diff:\n\n' >> "$verify_input"
+  cat "$TMPDIR_PT/diff" >> "$verify_input"
+
+  export _PT_PROMPT_FILE="$verify_input"
+  export _PT_PASS="verify"
+  export _PT_MODEL="$CURSOR_MODEL"
+
+  local text
+  case "$AI_ENGINE" in
+    cursor)    text=$(run_ai_cursor "$verify_prompt" "verify" "$CURSOR_MODEL") ;;
+    anthropic) text=$(run_ai_anthropic "$verify_prompt" "verify" "$ANTHROPIC_MODEL") ;;
   esac
 
   unset _PT_PROMPT_FILE _PT_PASS _PT_MODEL
@@ -658,24 +853,69 @@ run_passes() {
   section "Review passes"
   for pass in "${PASSES[@]}"; do
     idx=$((idx + 1))
-    local clr count prompt findings label
+    local clr raw_count count prompt findings label model_used
     clr=$(pass_color "$pass")
     label=$(pass_label "$pass")
-    printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s ${DIM}thinking…${RST}" "$idx" "$total" "$clr" "$RST" "$label"
+    model_used=$(_model_for_pass "$pass")
+
+    # ponytail: skip over-engineering pass on small diffs — not worth the noise
+    if [[ "$pass" == "ponytail" ]] && (( ADDED_LINES < PONYTAIL_MIN_ADDED )); then
+      printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s ${MUTE}skipped (+%d lines < %d threshold)${RST}\n" \
+        "$idx" "$total" "$clr" "$RST" "$label" "$ADDED_LINES" "$PONYTAIL_MIN_ADDED"
+      continue
+    fi
+
+    printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s ${DIM}thinking… (${model_used})${RST}" \
+      "$idx" "$total" "$clr" "$RST" "$label"
     prompt=$("prompt_${pass}")
     findings=$(run_ai "$prompt" "$pass")
+    raw_count=$(echo "$findings" | jq 'length')
+    findings=$(filter_by_confidence "$findings")
     count=$(echo "$findings" | jq 'length')
-    # rewrite the same line
     printf "\r\033[K"
     if [[ "$count" -eq 0 ]]; then
-      printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s ${BGRN}clean${RST}\n" "$idx" "$total" "$clr" "$RST" "$label"
+      if (( raw_count > 0 )); then
+        printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s ${BGRN}clean${RST} ${MUTE}(%d below confidence ≥%s)${RST}\n" \
+          "$idx" "$total" "$clr" "$RST" "$label" "$raw_count" "$CONFIDENCE_THRESHOLD"
+      else
+        printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s ${BGRN}clean${RST}\n" \
+          "$idx" "$total" "$clr" "$RST" "$label"
+      fi
     else
-      printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s %s%d finding(s)%s\n" \
-        "$idx" "$total" "$clr" "$RST" "$label" "$clr" "$count" "$RST"
+      local dropped=$((raw_count - count))
+      if (( dropped > 0 )); then
+        printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s %s%d finding(s)%s ${MUTE}(%d dropped)${RST}\n" \
+          "$idx" "$total" "$clr" "$RST" "$label" "$clr" "$count" "$RST" "$dropped"
+      else
+        printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s %s%d finding(s)%s\n" \
+          "$idx" "$total" "$clr" "$RST" "$label" "$clr" "$count" "$RST"
+      fi
     fi
     findings=$(echo "$findings" | jq --arg tag "$pass" '[.[] | . + {tag: $tag}]')
     all_findings=$(jq -s '.[0] + .[1]' <(echo "$all_findings") <(echo "$findings"))
   done
+
+  local pre_verify_count
+  pre_verify_count=$(echo "$all_findings" | jq 'length')
+
+  if (( pre_verify_count > 0 )); then
+    echo ""
+    printf "  ${DIM}verifying %d finding(s)…${RST}" "$pre_verify_count"
+    local verified
+    verified=$(verify_findings "$all_findings")
+    local post_verify_count
+    post_verify_count=$(echo "$verified" | jq 'length')
+    printf "\r\033[K"
+    local pruned=$((pre_verify_count - post_verify_count))
+    if (( pruned > 0 )); then
+      printf "  ${OKC}✓${RST}  verified: ${B}%d kept${RST}, ${MUTE}%d pruned as false positive${RST}\n" \
+        "$post_verify_count" "$pruned"
+    else
+      printf "  ${OKC}✓${RST}  verified: ${B}%d finding(s) confirmed${RST}\n" "$post_verify_count"
+    fi
+    all_findings="$verified"
+  fi
+
   echo "$all_findings" > "$TMPDIR_PT/findings.json"
   echo ""
 }
