@@ -93,20 +93,6 @@ ponytail setup                             # check dependencies & config
 | `MAX_CONTEXT_FILES` | Max changed files to fetch full contents for (default: `20`) |
 | `MAX_INLINE_COMMENTS` | Hard cap on posted inline comments (default: `8`) |
 
-## v2.1 — evidence-backed comments
-
-v2.1 targets the failure mode from [partner-api#1780](https://github.com/Orange-Health/partner-api/pull/1780): comments like *"any code depending on X will break"* with **zero call sites**.
-
-Every finding now requires:
-- `evidence[]` pinpoints (`path:line — what proves the claim`)
-- `impact` (who breaks and how)
-- `severity` (`blocker` | `warning` | `nit`)
-
-Hard filters drop findings that:
-- lack pinpoints
-- use speculative wording (`may` / `might` / `will break` / `any code depending on…`)
-- claim a **regression** without citing a **consumer** outside the changed file itself
-- omit confidence (fail-closed)
 
 Posted comments render as:
 
