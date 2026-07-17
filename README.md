@@ -101,8 +101,6 @@ ponytail setup                             # check dependencies & config
 
 ## v2.1 — evidence-backed comments
 
-Targets [partner-api#1780](https://github.com/Orange-Health/partner-api/pull/1780)-style FUD (*"any code depending on X will break"* with zero call sites).
-
 Every finding requires `evidence[]`, `impact`, and `severity`. Hard filters drop speculative wording and regressions without a consumer outside the changed file.
 
 Posted comments render as:
