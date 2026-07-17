@@ -93,16 +93,6 @@ ponytail setup                             # check dependencies & config
 | `MAX_CONTEXT_FILES` | Max changed files to fetch full contents for (default: `20`) |
 | `MAX_INLINE_COMMENTS` | Hard cap on posted inline comments (default: `8`) |
 
-## v2.2 — verified evidence + reliable line attach
-
-- **Evidence existence check:** every `path:line` in `evidence[]` must exist in fetched file contents (line ≤ file length) or on a real diff hunk line. Hallucinated pinpoints are dropped before posting.
-- **Hunk line snap:** builds a map of valid RIGHT-side diff lines from `@@` hunks. If the model's line is slightly off, snaps to the nearest attachable line (within 25). If none exists, the finding goes in the **summary review** (with full evidence) instead of silently failing.
-- GitHub attach failures also fall back to the summary — authors always see the pinpoint.
-
-## v2.1 — evidence-backed comments
-
-Every finding requires `evidence[]`, `impact`, and `severity`. Hard filters drop speculative wording and regressions without a consumer outside the changed file.
-
 Posted comments render as:
 
 ```markdown
