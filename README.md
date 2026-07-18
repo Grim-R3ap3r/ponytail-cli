@@ -84,8 +84,22 @@ ponytail setup                             # check dependencies & config
 | `PONYTAIL_MIN_ADDED` | Skip the over-engineering pass when added lines are below this (default: `80`) |
 | `MAX_CONTEXT_FILES` | Max changed files to fetch full contents for (default: `20`) |
 | `MAX_INLINE_COMMENTS` | Hard cap on posted inline comments (default: `8`) |
+| `PONYTAIL_AGENT` | `1` (default) = bugs/regression use a **tool-using local Cursor agent** on a PR-head checkout; `0` = oneshot prompt only |
 
-Posted comments render as:
+## v3.0 — agent + tools for bugs/regression
+
+Bugs and regression no longer rely on a stuffed oneshot prompt alone. With Cursor engine + `PONYTAIL_AGENT=1`:
+
+1. Shallow-clones the PR head into a temp workspace
+2. Runs `Agent.prompt(..., { local: { cwd } })` so the model can **read/grep** the real tree
+3. Requires grepped callers before any regression claim
+4. Falls back to oneshot only if the agent run errors (not if it correctly returns `[]`)
+
+Ponytail (over-eng) and verify stay oneshot. Anthropic engine stays oneshot (no local agent tools).
+
+Disable agent mode: `PONYTAIL_AGENT=0 ponytail <PR> --dry-run`
+
+Posted comments still look like:
 
 ```markdown
 **[regression]** · warning · confidence 8
@@ -104,16 +118,17 @@ Remove fallback default timeout.
 - [jq](https://jqlang.github.io/jq/) — JSON processing
 - curl
 - One of: `CURSOR_API_KEY` or `ANTHROPIC_API_KEY`
-- Node.js + `@cursor/sdk` (only if using Cursor engine)
+- Node.js + `@cursor/sdk` (only if using Cursor engine; required for agent mode)
 
 ## How it works
 
 1. Fetches the PR diff + metadata, and full contents of changed files
-2. Builds a RIGHT-side hunk map for attachable lines
-3. Runs review passes with confidence + evidence filters
-4. Verifies evidence pinpoints exist in known files / hunks
-5. Snaps comment lines onto real diff lines (or defers to summary)
-6. Posts inline comments + a summary review
+2. Clones the PR head (Cursor agent mode) for tool-using bugs/regression review
+3. Builds a RIGHT-side hunk map for attachable lines
+4. Runs review passes with confidence + evidence filters
+5. Verifies evidence pinpoints exist in known files / hunks
+6. Snaps comment lines onto real diff lines (or defers to summary)
+7. Posts inline comments + a summary review
 
 ## License
 

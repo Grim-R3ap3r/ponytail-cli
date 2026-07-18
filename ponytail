@@ -4,7 +4,7 @@
 #        ponytail setup             check dependencies and configuration
 set -euo pipefail
 
-VERSION="2.2.2"
+VERSION="3.0.0"
 
 # ── colors (disabled when piped) ──────────────────────────────────────
 # Soft 256-color accents when the terminal supports them; else basic ANSI.
@@ -39,6 +39,8 @@ CURSOR_MODEL="${CURSOR_MODEL:-auto}"
 CURSOR_MODEL_REVIEW="${CURSOR_MODEL_REVIEW:-auto}"
 ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}"
 ANTHROPIC_MODEL_REVIEW="${ANTHROPIC_MODEL_REVIEW:-claude-opus-4-6}"
+# ponytail: agent mode — bugs/regression run with local tools (grep/read) against PR head.
+PONYTAIL_AGENT="${PONYTAIL_AGENT:-1}"
 MAX_DIFF_BYTES=150000
 MAX_FILE_BYTES=50000         # per-file cap when fetching full context
 MAX_CONTEXT_FILES="${MAX_CONTEXT_FILES:-20}"       # fetch at most this many changed files
@@ -61,6 +63,8 @@ DRY_RUN=false
 PASSES=()
 TMPDIR_PT=""
 AI_ENGINE=""
+AGENT_WORKSPACE=""   # local checkout of PR head for tool-using review
+REVIEW_MODE="oneshot"
 
 # ── cleanup ───────────────────────────────────────────────────────────
 cleanup() { [[ -n "${TMPDIR_PT:-}" ]] && rm -rf "$TMPDIR_PT" || :; }
@@ -450,6 +454,7 @@ fetch_pr() {
   ADDED_LINES=$(grep -c '^+[^+]' "$TMPDIR_PT/diff" 2>/dev/null || echo 0)
 
   fetch_file_context
+  prepare_pr_workspace
 
   local human_sz
   if (( sz >= 1024 )); then
@@ -471,9 +476,9 @@ fetch_pr() {
   echo "  ${DIM}commit${RST} ${COMMIT:0:12}   ${DIM}diff${RST} ${human_sz}   ${DIM}+lines${RST} ${ADDED_LINES}   ${DIM}files${RST} ${ctx_count}"
   echo "  ${DIM}engine${RST} ${AI_ENGINE}   ${DIM}confidence${RST} ≥${CONFIDENCE_THRESHOLD}   ${DIM}mode${RST} ${mode}"
   if [[ "$AI_ENGINE" == "cursor" ]]; then
-    echo "  ${DIM}model${RST} review=${CURSOR_MODEL_REVIEW}   other=${CURSOR_MODEL}"
+    echo "  ${DIM}model${RST} review=${CURSOR_MODEL_REVIEW}   other=${CURSOR_MODEL}   ${DIM}review${RST} ${REVIEW_MODE}"
   else
-    echo "  ${DIM}model${RST} review=${ANTHROPIC_MODEL_REVIEW}   other=${ANTHROPIC_MODEL}"
+    echo "  ${DIM}model${RST} review=${ANTHROPIC_MODEL_REVIEW}   other=${ANTHROPIC_MODEL}   ${DIM}review${RST} oneshot"
   fi
   echo ""
   hr
@@ -537,6 +542,42 @@ fetch_file_context() {
 
   build_file_line_index
   build_hunk_map
+}
+
+# Shallow-checkout PR head so the Cursor agent can grep/read the real tree.
+prepare_pr_workspace() {
+  AGENT_WORKSPACE=""
+  REVIEW_MODE="oneshot"
+  [[ "${PONYTAIL_AGENT:-1}" != "1" ]] && return 0
+  [[ "$AI_ENGINE" != "cursor" ]] && return 0
+
+  local ws="$TMPDIR_PT/workspace"
+  info "cloning PR head for agent tools…"
+  if ! gh repo clone "$REPO" "$ws" -- --depth 1 --no-checkout \
+      >"$TMPDIR_PT/clone.out" 2>"$TMPDIR_PT/clone.err"; then
+    warn "agent workspace" "clone failed — oneshot fallback"
+    return 0
+  fi
+
+  if ! (
+    cd "$ws" || exit 1
+    # Prefer exact commit; fall back to pull/N/head ref.
+    if git fetch --depth 1 origin "$COMMIT" 2>/dev/null; then
+      git checkout --force "$COMMIT" >/dev/null 2>&1
+    elif git fetch --depth 1 origin "pull/${PR}/head:ponytail-pr" 2>/dev/null; then
+      git checkout --force ponytail-pr >/dev/null 2>&1
+    else
+      exit 1
+    fi
+  ); then
+    warn "agent workspace" "checkout failed — oneshot fallback"
+    rm -rf "$ws"
+    return 0
+  fi
+
+  AGENT_WORKSPACE="$ws"
+  REVIEW_MODE="agent+tools"
+  ok "agent workspace" "${COMMIT:0:12}"
 }
 
 # Index fetched files: path → line count (for evidence existence checks).
@@ -986,16 +1027,93 @@ run_ai_cursor() {
           apiKey: process.env.CURSOR_API_KEY,
           model: { id: process.env._PT_MODEL },
         });
+        if (result.status === 'error') {
+          process.stderr.write('cursor-sdk run error (' + process.env._PT_PASS + '): status=error\\n');
+          process.stdout.write('[]');
+          return;
+        }
         process.stdout.write(result.result || '[]');
       } catch (e) {
-        process.stderr.write('cursor-sdk error (' + process.env._PT_PASS + '): ' + e.message + '\n');
+        process.stderr.write('cursor-sdk error (' + process.env._PT_PASS + '): ' + e.message + '\\n');
         process.stdout.write('[]');
       }
     })();
   "
 }
 
-# Build the user message: PR metadata + diff + file context.
+# Tool-using local agent: cwd = PR head. Can grep/read; must not invent callers.
+run_ai_cursor_agent() {
+  local system_prompt="$1" pass_name="$2" model="$3"
+  echo "error" > "$TMPDIR_PT/agent_status"
+
+  NODE_PATH=$(npm root -g) NODE_NO_WARNINGS=1 node -e "
+    const { Agent } = require('@cursor/sdk');
+    const fs = require('fs');
+    const prompt = fs.readFileSync(process.env._PT_PROMPT_FILE, 'utf8');
+    const cwd = process.env._PT_WORKSPACE;
+    const statusFile = process.env._PT_AGENT_STATUS;
+    (async () => {
+      try {
+        const result = await Agent.prompt(prompt, {
+          apiKey: process.env.CURSOR_API_KEY,
+          model: { id: process.env._PT_MODEL },
+          local: { cwd },
+        });
+        if (result.status === 'error') {
+          process.stderr.write('cursor-agent run error (' + process.env._PT_PASS + '): status=error\\n');
+          fs.writeFileSync(statusFile, 'error');
+          process.stdout.write('[]');
+          return;
+        }
+        fs.writeFileSync(statusFile, 'ok');
+        process.stdout.write(result.result || '[]');
+      } catch (e) {
+        process.stderr.write('cursor-agent error (' + process.env._PT_PASS + '): ' + e.message + '\\n');
+        try { fs.writeFileSync(statusFile, 'error'); } catch (_) {}
+        process.stdout.write('[]');
+      }
+    })();
+  "
+}
+
+# Briefing for agent mode: rules + PR + diff + investigate instructions (no file dump).
+_build_agent_briefing() {
+  local system_prompt="$1" pass_name="$2"
+  local out="$TMPDIR_PT/agent_prompt.txt"
+  : > "$out"
+
+  printf '%s\n\n' "$system_prompt" >> "$out"
+  cat <<EOF >> "$out"
+## How to investigate (required)
+
+You have a local checkout of this PR head at the workspace root.
+Use your tools (read files, grep/search the codebase) before emitting any finding.
+
+Rules for tool use:
+- For ANY regression claim: grep for callers / leftover old API usage across the repo.
+  If you cannot find a concrete broken consumer path:line via search → do NOT emit it.
+- For usage-count / "used once" claims: grep the symbol; cite real hits.
+- Do not invent path:line evidence. Every evidence entry must come from a file you read or a grep hit.
+- Do not modify any files. Review only.
+- Prefer returning [] over speculative findings.
+
+Changed files in this PR:
+EOF
+  if [[ -s "$TMPDIR_PT/diff_paths" ]]; then
+    sed 's/^/- /' "$TMPDIR_PT/diff_paths" >> "$out"
+  fi
+  printf '\n' >> "$out"
+
+  if [[ -n "$PR_TITLE" || -n "$PR_BODY" ]]; then
+    printf '## PR description\n\n**%s**\n\n%s\n\n' "$PR_TITLE" "$PR_BODY" >> "$out"
+  fi
+
+  printf '## Diff\n\n' >> "$out"
+  cat "$TMPDIR_PT/diff" >> "$out"
+  printf '\n\nReturn ONLY the JSON array of findings. No markdown fences. No prose outside JSON.\n' >> "$out"
+}
+
+# Build the user message: PR metadata + diff + file context (oneshot path).
 _build_user_prompt() {
   local out="$TMPDIR_PT/prompt.txt"
   : > "$out"
@@ -1013,14 +1131,42 @@ _build_user_prompt() {
   fi
 }
 
+_use_agent_for_pass() {
+  local pass="$1"
+  [[ "$AI_ENGINE" == "cursor" ]] || return 1
+  [[ "${PONYTAIL_AGENT:-1}" == "1" ]] || return 1
+  [[ -n "$AGENT_WORKSPACE" && -d "$AGENT_WORKSPACE" ]] || return 1
+  case "$pass" in
+    bugs|regression) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 run_ai() {
   local system_prompt="$1" pass_name="$2" text
   local model
   model=$(_model_for_pass "$pass_name")
 
+  if _use_agent_for_pass "$pass_name"; then
+    _build_agent_briefing "$system_prompt" "$pass_name"
+    export _PT_PROMPT_FILE="$TMPDIR_PT/agent_prompt.txt"
+    export _PT_PASS="$pass_name"
+    export _PT_MODEL="$model"
+    export _PT_WORKSPACE="$AGENT_WORKSPACE"
+    export _PT_AGENT_STATUS="$TMPDIR_PT/agent_status"
+    text=$(run_ai_cursor_agent "$system_prompt" "$pass_name" "$model")
+    local agent_status
+    agent_status=$(cat "$TMPDIR_PT/agent_status" 2>/dev/null || echo error)
+    unset _PT_PROMPT_FILE _PT_PASS _PT_MODEL _PT_WORKSPACE _PT_AGENT_STATUS
+    if [[ "$agent_status" == "ok" ]]; then
+      extract_json_array "$text"
+      return
+    fi
+    info "agent failed for ${pass_name} — oneshot fallback"
+  fi
+
   printf '%s\n\nReview this PR:\n\n' "$system_prompt" > "$TMPDIR_PT/system.txt"
   _build_user_prompt
-  # For Cursor SDK: system + user go into one file
   local combined="$TMPDIR_PT/combined_prompt.txt"
   cat "$TMPDIR_PT/system.txt" "$TMPDIR_PT/prompt.txt" > "$combined"
 
@@ -1154,8 +1300,10 @@ run_passes() {
       continue
     fi
 
-    printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s ${DIM}thinking… (${model_used})${RST}" \
-      "$idx" "$total" "$clr" "$RST" "$label"
+    local think_label="thinking"
+    _use_agent_for_pass "$pass" && think_label="investigating"
+    printf "  ${DIM}[%d/%d]${RST} %s●%s %-12s ${DIM}%s… (${model_used})${RST}" \
+      "$idx" "$total" "$clr" "$RST" "$label" "$think_label"
     prompt=$("prompt_${pass}")
     findings=$(run_ai "$prompt" "$pass")
     raw_count=$(echo "$findings" | jq 'length')
