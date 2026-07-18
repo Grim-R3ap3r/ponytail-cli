@@ -2,20 +2,6 @@
 
 AI-powered PR review CLI. Three review passes in one command — **bugs**, **regression risk**, and **over-engineering**.
 
-```
-   ╭─╮ ponytail  v2.2.1
-   ╰─╯ lazy senior reviews
-
-  Commands
-  review a PR                  ponytail <PR>
-  check your environment       ponytail setup
-  preview (no GitHub post)     --dry-run
-
-  Try next
-  first-time check             ponytail setup
-  safe preview                 ponytail 162 --dry-run
-```
-
 ## Install
 
 ```bash
