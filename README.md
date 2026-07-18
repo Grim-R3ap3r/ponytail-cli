@@ -6,8 +6,6 @@
   />
 </p>
 
-# ponytail
-
 AI-powered PR review CLI. Three review passes in one command — **bugs**, **regression risk**, and **over-engineering**.
 
 ## Install
