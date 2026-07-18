@@ -76,10 +76,10 @@ ponytail setup                             # check dependencies & config
 |----------|-------------|
 | `CURSOR_API_KEY` | Cursor SDK API key (preferred engine) |
 | `ANTHROPIC_API_KEY` | Anthropic API key (curl fallback) |
-| `CURSOR_MODEL` | Model for ponytail/verify passes (default: `claude-sonnet-4`) |
-| `CURSOR_MODEL_REVIEW` | Model for bugs/regression (default: `claude-opus-4-6`) |
-| `ANTHROPIC_MODEL` | Model for Anthropic ponytail/verify (default: `claude-sonnet-4-20250514`) |
-| `ANTHROPIC_MODEL_REVIEW` | Model for Anthropic bugs/regression (default: `claude-opus-4-6`) |
+| `CURSOR_MODEL` | Cursor SDK model for ponytail/verify (default: `auto`) |
+| `CURSOR_MODEL_REVIEW` | Cursor SDK model for bugs/regression (default: `auto`) |
+| `ANTHROPIC_MODEL` | Anthropic model for ponytail/verify (default: `claude-sonnet-4-20250514`) |
+| `ANTHROPIC_MODEL_REVIEW` | Anthropic model for bugs/regression (default: `claude-opus-4-6`) |
 | `CONFIDENCE_THRESHOLD` | Minimum confidence (1-10) to post a finding (default: `7`) |
 | `PONYTAIL_MIN_ADDED` | Skip the over-engineering pass when added lines are below this (default: `80`) |
 | `MAX_CONTEXT_FILES` | Max changed files to fetch full contents for (default: `20`) |

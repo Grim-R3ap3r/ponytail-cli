@@ -4,7 +4,7 @@
 #        ponytail setup             check dependencies and configuration
 set -euo pipefail
 
-VERSION="2.2.1"
+VERSION="2.2.2"
 
 # ── colors (disabled when piped) ──────────────────────────────────────
 # Soft 256-color accents when the terminal supports them; else basic ANSI.
@@ -34,9 +34,9 @@ else
 fi
 
 # ── config ────────────────────────────────────────────────────────────
-CURSOR_MODEL="${CURSOR_MODEL:-claude-sonnet-4}"
-# Stronger model for bugs/regression (reasoning). Override with CURSOR_MODEL_REVIEW.
-CURSOR_MODEL_REVIEW="${CURSOR_MODEL_REVIEW:-claude-opus-4-6}"
+# Cursor SDK: "auto" lets the server pick. Override with CURSOR_MODEL / CURSOR_MODEL_REVIEW.
+CURSOR_MODEL="${CURSOR_MODEL:-auto}"
+CURSOR_MODEL_REVIEW="${CURSOR_MODEL_REVIEW:-auto}"
 ANTHROPIC_MODEL="${ANTHROPIC_MODEL:-claude-sonnet-4-20250514}"
 ANTHROPIC_MODEL_REVIEW="${ANTHROPIC_MODEL_REVIEW:-claude-opus-4-6}"
 MAX_DIFF_BYTES=150000
