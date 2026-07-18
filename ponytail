@@ -4,7 +4,7 @@
 #        ponytail setup             check dependencies and configuration
 set -euo pipefail
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 
 # ── colors (disabled when piped) ──────────────────────────────────────
 # Soft 256-color accents when the terminal supports them; else basic ANSI.
@@ -935,13 +935,30 @@ You are reviewing a GitHub PR diff (unified diff) plus full file contents.
 Apply the ponytail-review rules above to ADDED lines only (+ lines).
 
 Emit findings as a JSON array:
-[{"path":"...","line":N,"body":"<tag>: <what>. <replacement>. (-N lines)","confidence":N,"severity":"nit","evidence":["path:line — …"],"impact":"why the shorter form is safe"}]
+[{"path":"...","line":N,"body":"<tag>: <what>. <replacement>. (-N lines)","confidence":N,"severity":"warning","evidence":["path:line — …"],"impact":"why the shorter form is safe"}]
 
-- Use full files to verify "used once" / "one caller" claims. Cite evidence.
-- Readability intermediate vars are NOT yagni.
-- Do not flag consistent library migrations as over-engineering.
-- Nothing to cut → return [].
-- Return ONLY the JSON array. No markdown fences.
+### Hard exclusions (do NOT emit — these are false positives)
+
+- Public service/API methods on a NEW module just because only tests call them yet.
+  "One test caller" ≠ yagni. yagni means abstraction-with-one-implementation, not
+  "shipped API surface with incomplete production callers."
+- Deleting methods that management commands, admin, future features, or seeds will use.
+- Intentional migration / compat shims (legacy cache shapes, dual-read, "drop old format")
+  when comments or tests document why they exist.
+- Suggesting a redesign of brand-new greenfield code ("rewrite the cache tuple") —
+  that is the opposite of lazy. Prefer Lean already. Ship.
+- Nit-level shrinks (-1/-2 lines) or readability vars.
+- Flagging tests that lock intentional behavior.
+
+### When to flag (rare)
+
+- Hand-rolled helper the stdlib/platform already provides (name it).
+- Dead code with ZERO callers including tests, commands, and migrations.
+- Extra dependency imported for one trivial call with a clear native replacement.
+
+severity: use "warning" only for clear cuts. Do NOT use "nit".
+If unsure → return []. Lean already. Ship. is the correct default.
+Return ONLY the JSON array. No markdown fences.
 PROMPT
 }
 
@@ -1205,17 +1222,19 @@ filter_findings() {
         | length > 0);
     def is_regression:
       ((.body // "") | test("(?i)regression"));
+    # Bad over-eng patterns that waste author time.
+    def bad_ponytail:
+      ((.body // "") + " " + (.impact // ""))
+      | test("(?i)test-only caller|sole caller test|only exercises that branch|delete method|never list all|legacy negative-cache|rewrite.*(cache|tuple)|_MISSING sentinel");
     [
       .[]
       | select((.confidence // 0) >= $thresh)
       | select(has_evidence)
       | select(speculative | not)
       | select((is_regression | not) or has_consumer_evidence)
-      | select(
-          (.severity == "blocker")
-          or (.severity == "warning")
-          or (.severity == "nit")
-        )
+      # Live posts: blocker/warning only — nits are noise on real PRs.
+      | select((.severity == "blocker") or (.severity == "warning"))
+      | select(bad_ponytail | not)
     ]
 JQ
 )
@@ -1245,6 +1264,8 @@ For EACH finding, keep it ONLY if ALL of these are true:
    without cited call sites.
 
 Drop style nits. Drop speculative type/leak/logging claims without proof.
+Drop "delete public method because only tests call it" and "rewrite brand-new cache"
+over-engineering nits — those are false positives on greenfield modules.
 
 Return ONLY the surviving findings as a JSON array (same schema).
 If none survive → []. No markdown fences. No explanation.
