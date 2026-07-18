@@ -1,3 +1,11 @@
+<p align="center">
+  <img
+    src="https://github.com/user-attachments/assets/9fa73253-2db0-4748-b54a-80a7f0133c7d"
+    alt="image"
+    width="463"
+  />
+</p>
+
 # ponytail
 
 AI-powered PR review CLI. Three review passes in one command — **bugs**, **regression risk**, and **over-engineering**.
